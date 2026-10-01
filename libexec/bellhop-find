@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# bellhop find (prefix /): find any tab on the server and go to it. One row per
+# tab: numbered sessions first in slot order, then the sessions off the map.
+# A Claude's conversation title is shown after the tab name when the two
+# differ, so typing a few words of the conversation finds it even when tmux
+# named the tab "node" or "sh". Enter goes there (bh_jump); ctrl-g grabs the
+# tab into the session you are in instead.
+#
+#   bellhop find [client session_id window_id]         the popup
+#   bellhop find --rows [--shown] [session_id window_id]  the rows, without fzf
+#   --preview PANE and --pick CLIENT SESSION WINDOW are internal.
+set -euo pipefail
+
+# The plugin folder, through any symlink to this file (compat.sh, which has
+# bh_realpath, lives under the folder we are looking for).
+_self=$0
+_n=0
+while [ -L "$_self" ] && [ "$_n" -lt 40 ]; do
+  _l=$(readlink "$_self")
+  case $_l in
+    /*) _self=$_l ;;
+    *) _self=$(dirname "$_self")/$_l ;;
+  esac
+  _n=$((_n + 1))
+done
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$_self")/.." && pwd -P)
+BH_CMD="find"
+# shellcheck source=../lib/bellhop/common.sh
+. "$ROOT/lib/bellhop/common.sh"
+
+# How to run this script again (in the popup, and for fzf's preview). A
+# checkout that lost its modes is run through bash, as the dispatcher does.
+SELF=("$0")
+[ -x "$0" ] || SELF=("${BASH:-bash}" "$0")
+
+usage() {
+  cat <<'EOF'
+usage: bellhop find [client session_id window_id]
+       bellhop find --rows [--shown] [session_id window_id]
+
+Find any tab in any session and go to it (prefix /). One row per tab: slot,
+session, tab name, the Claude conversation title when it differs from the tab
+name, and the Claude state. Typing matches all of the row text.
+
+keys
+  enter    go there
+  ctrl-g   grab it into this session (after your last tab)
+  ctrl-p   show or hide the preview
+  esc      close
+  typing   filters; fzf syntax works: 'exact  !not  ^prefix
+
+flags
+  --rows [session_id window_id]   the rows without fzf, tab-separated and
+                                  uncoloured: window_id pane_id session_id
+                                  session name text ("here" is the tab given)
+  --rows --shown [...]            only the text column, as fzf matches it
+EOF
+}
+
+case ${1:-} in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+esac
+
+if [ -z "${TMUX:-}" ]; then
+  die "only works inside tmux"
+fi
+
+# The pane we were typed in, when there is one: display-message without -t
+# would pick whichever client tmux thinks is current.
+HERE=()
+[ -z "${TMUX_PANE:-}" ] || HERE=(-t "$TMUX_PANE")
+
+# One row per window, from its active pane in bh_panes: window id, pane id,
+# session id, session, tab name, then the text shown. $1/$2 are the session
+# and tab you called from; $3 says whether to colour it.
+rows() {
+  local color=${3:-}
+  # The first input is the map rows, so numbered sessions sort in the order
+  # the map gives them (with no map file: 1-9, then 0).
+  bh_panes | LC_ALL=C awk -F '\t' -v OFS='\t' -v hs="$1" -v here="$2" -v color="$color" \
+    "$BH_AWK_WIDTH$BH_AWK_BADGE"'
+    FILENAME == ARGV[1] { if (!($1 in rank)) rank[$1] = FNR; next }
+    $9 != 1 { next }
+    {
+      pre = post = mark = extra = b = ""
+      # A window linked into two sessions is "here" only in yours.
+      if ($4 == here && $3 == hs) {
+        if (color) { pre = "\033[2m"; post = "\033[0m" }
+        mark = "  · here"
+      }
+      if ($13 != "none") {
+        # The conversation title, without the glyph Claude Code puts in front
+        # (✳ idle, a spinner while working), when the tab is named otherwise.
+        t = $12
+        sub(/^(✳|◐|◓|◑|◒|\342[\240-\243][\200-\277])[ \t]*/, "", t)
+        sub(/[ \t]+$/, "", t)
+        if (t != "" && t != $6) extra = " · " t
+        b = "  " (color ? "\033[" badge($13) "m" : "") "✳ " $13 (color ? "\033[0m" pre : "")
+      }
+      # Sort keys first (numbered sessions before the rest, then map order,
+      # session, tab order); cut off below.
+      off = ($1 == "") ? 1 : 0
+      r = off ? 0 : (($1 in rank) ? rank[$1] : 99)
+      print off, r, $2, $5, $4, $8, $3, $2, $6,
+        sprintf("%s %1s  %s%s%s%s%s%s", pre, $1, pad($2, 18), $6, extra, b, mark, post)
+    }' <(bh_map_rows) - | LC_ALL=C sort -t "$(printf '\t')" -k1,1n -k2,2n -k3,3 -k4,4n | cut -f5-
+}
+
+case ${1:-} in
+  --rows)
+    shift
+    shown='' ids=()
+    for a in "$@"; do
+      case $a in
+        --shown) shown=1 ;;
+        -*)
+          usage >&2
+          exit 2
+          ;;
+        *) ids+=("$a") ;;
+      esac
+    done
+    if [ ${#ids[@]} -eq 0 ]; then
+      # shellcheck disable=SC2046 # two ids with no spaces in them: the split is the point
+      set -- $(tmux display-message -p ${HERE[@]+"${HERE[@]}"} '#{session_id} #{window_id}')
+    elif [ ${#ids[@]} -eq 2 ]; then
+      set -- "${ids[@]}"
+    else
+      usage >&2
+      exit 2
+    fi
+    esc=$(printf '\033')
+    if [ -n "$shown" ]; then
+      rows "${1:-}" "${2:-}" | cut -f6 | sed "s/$esc\[[0-9;]*m//g"
+    else
+      rows "${1:-}" "${2:-}" | sed "s/$esc\[[0-9;]*m//g"
+    fi
+    exit 0
+    ;;
+  --preview)
+    # What the tab is showing: sanitised, without the blank screen below the prompt.
+    bh_preview "${2:-}"
+    exit 0
+    ;;
+  --pick)
+    [ $# -eq 4 ] || {
+      usage >&2
+      exit 2
+    }
+    ;;
+  -*)
+    usage >&2
+    exit 2
+    ;;
+  *)
+    # Reopen in a popup carrying client, session and tab: the key binding
+    # passes them because run-shell can't tell who pressed the key.
+    if [ $# -eq 3 ]; then
+      ctx=("$@")
+    elif [ $# -eq 0 ]; then
+      # \x1f, not tab: read collapses whitespace, so an empty client name
+      # would shift the session id into its place. With nobody attached here,
+      # tmux names some other session's client; don't pop up on their screen.
+      # (Asked first, read after: under bash 3.2 an IFS set for read also
+      # splits the words of a command inside a process substitution on its
+      # line, so tmux would get "-t %0" as one word.)
+      info=$(tmux display-message -p ${HERE[@]+"${HERE[@]}"} \
+        $'#{client_name}\x1f#{session_id}\x1f#{window_id}\x1f#{==:#{client_session},#{session_name}}')
+      IFS=$'\x1f' read -r -a ctx <<<"$info"
+      if [ -z "${ctx[0]:-}" ] || [ "${ctx[3]:-}" != 1 ]; then
+        die "no client is attached to this session"
+      fi
+    else
+      usage >&2
+      exit 2
+    fi
+    bh_fzf_check "${ctx[0]}" || exit 1
+    # A popup closed under us (the terminal went away, the client was killed)
+    # is a cancel, not an error: tmux would show "returned 129" in the pane.
+    rc=0
+    tmux display-popup -c "${ctx[0]}" -E -w 85% -h 75% -T ' Find a tab ' \
+      "$(printf '%q ' "${SELF[@]}" --pick "${ctx[@]:0:3}")" || rc=$?
+    case $rc in 129 | 130) rc=0 ;; esac
+    exit "$rc"
+    ;;
+esac
+
+client=$2 session=$3 current=$4
+BH_CLIENT=$client
+trap 'say "bellhop find: something went wrong (line $LINENO)"' ERR
+bh_locale || true
+
+# The preview sits beside the list in a wide popup and under it in a narrow
+# one (under 140 columns), as in the inbox, so the rows keep their room.
+pcols=''
+read -r _ pcols < <(stty size </dev/tty 2>/dev/null) || true
+case $pcols in '' | *[!0-9]*) pcols=100 ;; esac
+if [ "$pcols" -ge 140 ]; then
+  pvw=right,45%,nowrap,border-left
+else
+  pvw=down,45%,nowrap,border-top
+fi
+# @bellhop-preview off starts the preview hidden (screen-sharing); ctrl-p shows it.
+[ "$(bh_opt preview on)" != off ] || pvw=$pvw,hidden
+
+# Matching is on the text shown (no --nth: it would index after --with-nth).
+out=$(rows "$session" "$current" 1 |
+  bh_fzf --reverse --cycle --info=inline-right --ansi --delimiter=$'\t' --with-nth=6 \
+    --expect=ctrl-g --prompt='find a tab › ' \
+    --header='enter go there · ctrl-g grab it into this session · ctrl-p preview' \
+    --bind ctrl-p:toggle-preview \
+    --preview "$(printf '%q ' "${SELF[@]}") --preview {2}" --preview-window="$pvw") || exit 0
+key=$(sed -n 1p <<<"$out")
+# Split on \x1f: with tab, read would collapse an empty tab name away.
+IFS=$'\x1f' read -r win pane src sname name _ < <(sed -n 2p <<<"$out" | tr '\t' '\037') || exit 0
+[ -n "${win:-}" ] || exit 0
+
+if [ "$key" != ctrl-g ]; then
+  bh_jump "$win" "$pane" "$client"
+  exit 0
+fi
+
+# Yours already, or linked into yours as well: moving it would only shuffle
+# your own tab bar.
+if [ "$src" = "$session" ] || tmux list-windows -t "$session" -F '#{window_id}' | grep -xF -- "$win" >/dev/null; then
+  tmux select-window -t "$session:$win"
+  say "$name is already here"
+  exit 0
+fi
+# Taking a session's last tab closes it, so first bring anyone attached there
+# over here; otherwise their terminals would detach.
+if [ "$(tmux display-message -p -t "$src:$win" '#{session_windows}')" -eq 1 ]; then
+  while read -r c; do tmux switch-client -c "$c" -t "$session"; done \
+    < <(tmux list-clients -t "$src" -F '#{client_name}')
+fi
+# After the last tab (a bare "session:" would fill the first gap instead).
+tmux move-window -a -s "$src:$win" -t "$session:{end}"
+tmux select-window -t "$session:$win"
+say "Grabbed $name from $sname"

@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# bellhop inbox (prefix i): every Claude Code pane on the server, one row per
+# pane, the one waiting on you first, so prefix i then Enter goes straight to
+# it. The preview is that pane's screen, so you see what it is asking before
+# you go.
+#
+#   bellhop inbox [client session_id window_id [pane_id]]   the popup
+#   bellhop inbox --rows [pane-id]            the sorted rows, tab-separated:
+#       window_id pane_id state slot session window_index title detail here
+#   bellhop inbox --rows --shown [--cols N] [pane-id]
+#       the text fzf matches, one line per row, ANSI stripped, as a popup N
+#       columns wide draws it (default 142: the popup on a 160-column terminal)
+#   --preview PANE and --pick CLIENT SESSION WINDOW PANE are internal.
+set -euo pipefail
+
+# The plugin folder, through any symlink to this file (compat.sh, which has
+# bh_realpath, lives under the folder we are looking for).
+_self=$0
+_n=0
+while [ -L "$_self" ] && [ "$_n" -lt 40 ]; do
+  _l=$(readlink "$_self")
+  case $_l in
+    /*) _self=$_l ;;
+    *) _self=$(dirname "$_self")/$_l ;;
+  esac
+  _n=$((_n + 1))
+done
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$_self")/.." && pwd -P)
+BH_CMD="inbox"
+# shellcheck source=../lib/bellhop/common.sh
+. "$ROOT/lib/bellhop/common.sh"
+
+# How to run this script again (in the popup, and for fzf's preview). A
+# checkout that lost its modes is run through bash, as the dispatcher does.
+SELF=("$0")
+[ -x "$0" ] || SELF=("${BASH:-bash}" "$0")
+TAB=$'\t'
+
+usage() {
+  cat <<'EOF'
+usage: bellhop inbox [client session_id window_id [pane_id]]
+       bellhop inbox --rows [--shown [--cols N]] [pane-id]
+
+Every Claude Code pane on this tmux server, one row each (prefix i): needs
+you first, then finished (the newest ring first), working and idle. A row
+shows the state, the slot digit, the session, the conversation title and
+what it is asking or how long it has been at it; your own pane says · here.
+
+keys
+  enter    go there
+  ctrl-p   show or hide the preview
+  esc      close
+  typing   filters
+
+flags
+  --rows [pane-id]   the sorted rows without fzf, tab-separated:
+                     window_id pane_id state slot session window_index
+                     title detail here ("here" is 1 for the pane given)
+  --rows --shown     only the text fzf matches, uncoloured, one line per row
+  --cols N           with --shown: the popup's width in columns (default 142)
+EOF
+}
+
+case ${1:-} in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+esac
+
+if [ -z "${TMUX:-}" ]; then
+  die "only works inside tmux"
+fi
+[ -n "${TMUX_BIN:-}" ] || die "no tmux binary found (set BELLHOP_TMUX)"
+# Widths below count characters, which needs a UTF-8 locale (fzf does too).
+bh_locale || true
+
+# needs-you, then finished (newest first: the latest to ring is the one you
+# were just told about), then working, then idle; after that by slot (off the
+# map last), session, tab and pane. $1 is the pane that gets "here".
+rows() {
+  local here=${1:-}
+  # bh_panes reads the bell per window, so every ✳ Claude in a tab that rang
+  # looks finished. The one that rang is the latest to ring: @bellhop_rang if
+  # the hook keeps it, else @bellhop_since (a Stop sets it). The hook state
+  # can't say, since it stays "finished" after you've seen it, and "working"
+  # when you pressed Esc and it later rang for input.
+  {
+    tmux list-panes -a -F "#{pane_id}${TAB}#{@bellhop_rang}"
+    echo
+    bh_panes
+  } | LC_ALL=C awk -F '\t' -v OFS='\t' -v now="$(bh_now)" -v here="$here" '
+      function ago(s) {
+        if (s < 60) return (s < 0 ? 0 : s) "s"
+        if (s < 3600) return int(s / 60) "m"
+        if (s < 86400) return int(s / 3600) "h"
+        return int(s / 86400) "d"
+      }
+      !part { if (NF) rang[$1] = $2; else part = 1; next }
+      NF < 16 || $13 == "none" { next }
+      {
+        n++; w[n] = $4; p[n] = $8; c[n] = $13; slot[n] = $1; sess[n] = $2; idx[n] = $5; since[n] = $14
+        # bh_panes makes a tab in the note a space; join any split anyway.
+        note[n] = $16; for (i = 17; i <= NF; i++) note[n] = note[n] " " $i
+        ring[n] = ($8 in rang) && rang[$8] != "" ? rang[$8] : $14
+        # The title minus the leading ✳ or spinner (any first word with no letters).
+        t = $12
+        if (match(t, /^[^ ]+ +/) && substr(t, 1, RLENGTH) !~ /[A-Za-z0-9]/) t = substr(t, RLENGTH + 1)
+        title[n] = t
+        if (c[n] == "finished") { rung[$4]++; if (ring[n] + 0 > top[$4]) top[$4] = ring[n] + 0 }
+      }
+      END {
+        for (r = 1; r <= n; r++) {
+          s = c[r]
+          # Two Claudes in a tab that rang: only the newest ring is finished.
+          if (s == "finished" && rung[w[r]] > 1 && ring[r] + 0 < top[w[r]]) s = "idle"
+          rank = s == "needs-you" ? 0 : s == "finished" ? 1 : s == "working" ? 2 : 3
+          at = s == "finished" ? ring[r] : since[r]
+          fresh = rank <= 1 && at != "" ? 10000000000 - at : 10000000000
+          el = since[r] != "" ? ago(now - since[r]) : ""
+          if (s == "needs-you") { detail = note[r]; sub(/^Claude needs your /, "", detail); if (detail == "") detail = el }
+          else if (s == "finished") detail = ring[r] != "" ? "rang " ago(now - ring[r]) " ago" : ""
+          else detail = el
+          print rank, fresh, (slot[r] == "" ? 99 : slot[r]), sess[r], idx[r], substr(p[r], 2),
+            w[r], p[r], s, slot[r], sess[r], idx[r], title[r], detail, (p[r] == here)
+        }
+      }' | LC_ALL=C sort -t "$TAB" -k1,1n -k2,2n -k3,3n -k4,4 -k5,5n -k6,6n | cut -f7-
+}
+
+# layout COLS LINES NROWS: where the preview goes (SIDE) and how wide the row
+# text may be (WIDTH). Beside the list when the popup is wide, else under it,
+# so the list always has room for what each Claude is asking.
+layout() {
+  local cols=$1 lines=$2 n=$3 plen
+  if [ "$cols" -ge 140 ]; then
+    SIDE='right,55%,border-left' WIDTH=$((cols * 45 / 100 - 3))
+  else
+    # Under the list, the preview gets what the rows (plus prompt and header)
+    # leave, but never under a third of the height.
+    plen=$((lines - n - 7))
+    [ "$plen" -ge $((lines / 3)) ] || plen=$((lines / 3))
+    SIDE="down,$plen,border-top" WIDTH=$((cols - 3))
+  fi
+}
+
+# render WIDTH: rows (stdin) → window_id, pane_id, then what you see. The awk
+# counts UTF-8 characters by hand (BSD awk counts bytes).
+render() {
+  LC_ALL=C awk -F '\t' -v OFS='\t' -v width="$1" "$BH_AWK_WIDTH$BH_AWK_BADGE"'
+    {
+      row[NR] = $0
+      if (ulen($5) > sw) sw = ulen($5)
+      if (ulen($7) > tw) tw = ulen($7)
+      if (ulen($8) > dw) dw = ulen($8)
+      if ($9) hr = 1
+    }
+    END {
+      # The detail (what it is asking) keeps up to 24 columns, and the here row
+      # room for its marker; the title gives way first, then the session.
+      avail = width - 18
+      dmin = min(dw, 24); if (hr && dmin < 8) dmin = 8
+      sw = min(sw, 14); tw = min(tw, 32); tfloor = min(tw, 12); sfloor = min(sw, 4)
+      if (sw + tw + dmin > avail) tw = avail - sw - dmin
+      if (tw < tfloor) tw = tfloor
+      if (sw + tw + dmin > avail) sw = avail - tw - dmin
+      if (sw < sfloor) sw = sfloor
+      room = avail - sw - tw
+      for (r = 1; r <= NR; r++) {
+        split(row[r], f, "\t")
+        dim = f[9] ? "\033[2m" : ""
+        text = "\033[" (f[9] ? "2;" : "") badge(f[3]) "m" pad(badge_label(f[3]), 9) "\033[0m" dim \
+          " " (f[4] == "" ? " " : f[4]) "  " pad(f[5], sw) " " pad(f[7], tw) " " cut(f[8], room - (f[9] ? 8 : 0)) \
+          (f[9] ? "  · here" : "") "\033[0m"
+        print f[1], f[2], text
+      }
+    }'
+}
+
+case ${1:-} in
+  --rows)
+    shift
+    shown='' cols=142 here=${TMUX_PANE:-}
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --shown) shown=1 ;;
+        --cols)
+          [ $# -ge 2 ] || {
+            usage >&2
+            exit 2
+          }
+          cols=$2
+          shift
+          ;;
+        -*)
+          usage >&2
+          exit 2
+          ;;
+        *) here=${1:-${TMUX_PANE:-}} ;;
+      esac
+      shift
+    done
+    case $cols in '' | *[!0-9]*) die "--cols wants a number of columns" 2 ;; esac
+    if [ -z "$shown" ]; then
+      rows "$here"
+      exit 0
+    fi
+    all=$(rows "$here")
+    [ -n "$all" ] || exit 0
+    layout "$cols" 40 "$(printf '%s\n' "$all" | wc -l)"
+    esc=$(printf '\033')
+    render "$WIDTH" <<<"$all" | cut -f3 | sed "s/$esc\[[0-9;]*m//g"
+    exit 0
+    ;;
+  --preview)
+    # fzf's preview: the pane's screen, sanitised (SGR colours only), minus
+    # the blank lines under its prompt, cut from the bottom so the prompt shows.
+    [ -n "${2:-}" ] || {
+      usage >&2
+      exit 2
+    }
+    bh_preview "$2"
+    exit 0
+    ;;
+  --pick)
+    [ $# -eq 5 ] || {
+      usage >&2
+      exit 2
+    }
+    ;;
+  -*)
+    usage >&2
+    exit 2
+    ;;
+  *)
+    # First run: note which client, session, tab and pane we're on, then
+    # reopen in a popup (the key binding passes all four: run-shell can't
+    # tell who pressed the key).
+    if [ $# -eq 3 ] || [ $# -eq 4 ]; then
+      ctx=("$1" "$2" "$3" "${4:-}")
+    elif [ $# -eq 0 ]; then
+      # \x1f, not tab: read collapses whitespace, so an empty client name
+      # would shift the session id into its place. With nobody attached here,
+      # tmux names some other session's client; don't pop up on their screen.
+      # (Asked first, read after: an IFS set for read would also split the
+      # words of a command inside a process substitution on its line.)
+      tgt=()
+      [ -z "${TMUX_PANE:-}" ] || tgt=(-t "$TMUX_PANE")
+      info=$(tmux display-message -p ${tgt[@]+"${tgt[@]}"} \
+        $'#{client_name}\x1f#{session_id}\x1f#{window_id}\x1f#{pane_id}\x1f#{==:#{client_session},#{session_name}}')
+      IFS=$'\x1f' read -r -a ctx <<<"$info"
+      if [ -z "${ctx[0]:-}" ] || [ "${ctx[4]:-}" != 1 ]; then
+        die "no client is attached to this session"
+      fi
+      ctx=("${ctx[0]}" "${ctx[1]:-}" "${ctx[2]:-}" "${TMUX_PANE:-${ctx[3]:-}}")
+    else
+      usage >&2
+      exit 2
+    fi
+    BH_CLIENT=${ctx[0]}
+    if [ -z "$(rows "")" ]; then
+      msg="No Claude Code panes on this server"
+      # `hook status --quiet` works without jq. A missing hookctl fails too,
+      # which reads as "not installed": the hint is right either way.
+      if ! bh_watchdog 3 "$ROOT/bin/bellhop" hook status --quiet </dev/null >/dev/null 2>&1; then
+        msg="$msg · hook not installed: bellhop hook install"
+      fi
+      tmux display-message -c "$BH_CLIENT" -d 4000 "$msg"
+      exit 0
+    fi
+    # The message is on the client's status line; a non-zero exit from a
+    # key's run-shell would put tmux's own "returned 1" over it.
+    bh_fzf_check "$BH_CLIENT" || exit 0
+    exec tmux display-popup -c "$BH_CLIENT" -E -w 90% -h 70% -T ' Claudes ' \
+      "$(printf '%q ' "${SELF[@]}" --pick "${ctx[@]}")"
+    ;;
+esac
+
+client=$2 here=$5
+BH_CLIENT=$client
+trap 'say "bellhop inbox: something went wrong (line $LINENO)"' ERR
+
+lines='' cols=''
+read -r lines cols < <(stty size </dev/tty 2>/dev/null) || true
+lines=${lines:-24} cols=${cols:-100}
+all=$(rows "$here")
+[ -n "$all" ] || exit 0
+layout "$cols" "$lines" "$(printf '%s\n' "$all" | wc -l)"
+list=$(render "$WIDTH" <<<"$all")
+
+# @bellhop-preview off starts the preview hidden (screen-sharing); ctrl-p shows it.
+[ "$(bh_opt preview on)" != off ] || SIDE=$SIDE,hidden
+# "prefix L to come back" only while L still does what stock tmux does.
+header='enter go there · ctrl-p preview · esc close'
+# (The whole table: tmux 3.7 prints nothing for `list-keys -T prefix L`.)
+if tmux list-keys -T prefix 2>/dev/null | LC_ALL=C awk '
+  $1 == "bind-key" { i = 2; if ($i == "-r") i++
+    if ($i == "-T" && $(i + 1) == "prefix" && $(i + 2) == "L" && index($0, "switch-client -l")) found = 1 }
+  END { exit !found }'; then
+  header="$header · prefix L to come back"
+fi
+
+choice=$(bh_fzf --reverse --cycle --info=hidden --delimiter="$TAB" --ansi --no-sort --with-nth=3 \
+  --prompt='claude › ' --header="$header" --bind ctrl-p:toggle-preview \
+  --preview "$(printf '%q ' "${SELF[@]}") --preview {2}" --preview-window="$SIDE" <<<"$list") || exit 0
+[ -n "$choice" ] || exit 0
+
+# bh_jump selects the tab and pane, then lets a focus adapter raise a terminal
+# already showing that session, or switches this client there.
+IFS=$'\t' read -r win pane _ <<<"$choice"
+bh_jump "$win" "$pane" "$client"

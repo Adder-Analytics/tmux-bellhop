@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# bellhop move: carry tabs to another session and go with them. Step 1 picks
+# the tabs, step 2 the session: press its number and the tabs move there, and
+# so do you.
+#
+# The numbers are the slots of the session map (bellhop map): row N is slot N
+# whether or not its session is running, and a slot that isn't running is
+# started in its folder. Without a map, the running sessions are numbered 1-9,
+# then 0, in the order `prefix s` lists them.
+#
+# The key binding (prefix m) passes the client, session and tab, because
+# run-shell can't tell which client pressed the key. Typed in a pane, they come
+# from that pane. Either way the picker then opens in a popup, so it looks the
+# same both ways.
+set -euo pipefail
+
+# Our own path, through any symlink. By hand: compat.sh's bh_realpath lives in
+# the folder we are looking for. Never $BELLHOP_ROOT: the popup re-runs this
+# script with the tmux server's environment, not the caller's.
+_self=$0
+_n=0
+while [ -L "$_self" ] && [ "$_n" -lt 40 ]; do
+  _l=$(readlink "$_self")
+  case $_l in
+    /*) _self=$_l ;;
+    *) _self=$(dirname "$_self")/$_l ;;
+  esac
+  _n=$((_n + 1))
+done
+_dir=$(CDPATH='' cd -P -- "$(dirname -- "$_self")" && pwd -P)
+SELF=$_dir/$(basename -- "$_self")
+ROOT=$(CDPATH='' cd -P -- "$_dir/.." && pwd -P)
+
+BH_CMD=move
+# shellcheck source=../lib/bellhop/common.sh
+. "$ROOT/lib/bellhop/common.sh"
+
+usage() {
+  cat <<'EOF'
+usage: bellhop move [client session_id window_id]
+
+Moves tabs to another session and takes you with them (prefix m). With no
+arguments, the tab, session and client are the ones of the current pane.
+
+step 1 · which tabs ›    skipped when the session has one tab
+  enter     the tab under the cursor (it starts on yours)
+  tab       mark several
+  ctrl-a    mark all, or none
+  esc       cancel
+
+step 2 · move <tabs> to ›
+  0-9       move to that number and go with the tabs
+  enter     move to the highlighted session and go with the tabs
+  ctrl-s    move and stay behind (@bellhop-move-stay-key)
+  esc       cancel
+
+The numbers are the slots of the session map (bellhop map). A slot whose
+session isn't running is started in the slot's folder, or in ~ when that
+folder is gone. Without a map, the running sessions are numbered 1-9, then 0.
+Sessions without a number are listed under a rule: type their name.
+Moving every tab of a session takes everyone attached to it along.
+EOF
+}
+
+case ${1:-} in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+esac
+
+[ -n "${TMUX:-}" ] || die "only works inside tmux" 1
+
+stay=$(bh_opt move-stay-key ctrl-s)
+
+# step2_header: set $header to step 2's keys, naming the stay-behind key, and
+# $hinted when it ends in the no-map reminder (the numbers can shift as
+# sessions come and go). The launch sizes the popup for it.
+step2_header() {
+  header="0-9 move and go with it · enter this one · $stay stay behind"
+  hinted=''
+  if bh_map_rows | LC_ALL=C awk -F '\t' '$4 == "0" { found = 1; exit } END { exit !found }'; then
+    header="$header · bellhop map init to pin these"
+    hinted=1
+  fi
+}
+
+# ── first run: open the popup ────────────────────────────────────────────────
+if [ "${1:-}" != --pick ]; then
+  case $# in
+    3) client=$1 session=$2 window=$3 ;;
+    0)
+      # With nobody attached here, tmux names some other session's client;
+      # don't pop up on their screen. (Asked first, read after, as in find.)
+      at=()
+      [ -z "${TMUX_PANE:-}" ] || at=(-t "$TMUX_PANE")
+      info=$(tmux display-message -p ${at[@]+"${at[@]}"} \
+        $'#{client_name}\x1f#{session_id}\x1f#{window_id}\x1f#{==:#{client_session},#{session_name}}') ||
+        die "can't tell which tab this is" 1
+      IFS=$'\x1f' read -r -a ctx <<<"$info"
+      [ "${ctx[3]:-}" = 1 ] || die "no client is attached to this session" 1
+      client=${ctx[0]:-} session=${ctx[1]:-} window=${ctx[2]:-}
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+  [ -n "$client" ] || die "no client is attached to this session" 1
+  bh_fzf_check "$client" || exit 1
+  run=$(printf '%q ' "$SELF" --pick "$client" "$session" "$window")
+  # A checkout that lost its modes: run the popup's script with this bash.
+  [ -x "$SELF" ] || run="$(printf '%q ' "${BASH:-bash}")$run"
+  # 60% of the terminal, but wide enough for step 2's header (it names the
+  # stay-behind key) when the terminal has the room: 60% of 80 columns is not.
+  width=60%
+  cw=$(tmux display-message -p -c "$client" '#{client_width}' 2>/dev/null || true)
+  case $cw in
+    '' | *[!0-9]*) ;;
+    *)
+      step2_header
+      need=$((${#header} + 6))
+      [ "$need" -le "$cw" ] || need=$cw
+      [ "$need" -le $((cw * 60 / 100)) ] || width=$need
+      ;;
+  esac
+  # A popup closed under us (the terminal went away, the client was killed)
+  # is a cancel, not an error: tmux would show "returned 129" in the pane.
+  rc=0
+  "$TMUX_BIN" display-popup -c "$client" -E -w "$width" -h 50% -T ' Move tabs ' "$run" || rc=$?
+  case $rc in 129 | 130) rc=0 ;; esac
+  exit "$rc"
+fi
+
+# ── in the popup ─────────────────────────────────────────────────────────────
+[ $# -eq 4 ] || {
+  usage >&2
+  exit 2
+}
+client=$2 session=$3 current=$4
+BH_CLIENT=$client
+trap 'say "bellhop move: something went wrong (line $LINENO)"' ERR
+bh_locale || true
+
+TAB=$'\t'
+dim=$'\033[2m' rst=$'\033[0m'
+
+pick() { bh_fzf --reverse --cycle --info=hidden --delimiter="$TAB" "$@"; }
+
+# 1. Which tabs? One row per tab: id, name, "index  name" (the shown field).
+#    The cursor starts on yours; a session with a single tab has nothing to
+#    choose.
+tabs=$(tmux list-windows -t "$session" -F $'#{window_id}\x1f#{window_index}\x1f#{window_name}' |
+  LC_ALL=C awk -F $'\x1f' -v OFS='\t' '{ gsub(/\t/, " "); print $1, $3, $2 "  " $3 }')
+total=$(LC_ALL=C awk 'END { print NR }' <<<"$tabs")
+if [ "$total" -eq 1 ]; then
+  chosen=$tabs
+else
+  here=$(LC_ALL=C awk -F '\t' -v id="$current" '$1 == id { print NR; exit }' <<<"$tabs")
+  picked=$(pick --multi --with-nth=3 --prompt='which tabs › ' --bind "load:pos(${here:-1})" \
+    --bind 'ctrl-a:toggle-all' \
+    --header='enter this tab · tab mark several · ctrl-a all' <<<"$tabs") || exit 0
+  # fzf prints them in the order they were marked; keep the tab bar's order.
+  chosen=$(LC_ALL=C awk -F '\t' 'FILENAME == ARGV[1] { m[$1] = 1; next } $1 in m' \
+    <(printf '%s\n' "$picked") - <<<"$tabs")
+fi
+moving=()
+while IFS="$TAB" read -r id _; do
+  [ -z "$id" ] || moving+=("$id")
+done <<<"$chosen"
+count=${#moving[@]}
+[ "$count" -gt 0 ] || exit 0
+if [ "$count" -eq 1 ]; then
+  label=$(LC_ALL=C awk -F '\t' 'NR == 1 { print $2 }' <<<"$chosen")
+else
+  label="$count tabs"
+fi
+
+# 2. Where to? Each row is what-to-do, slot, shown text. One row per slot in
+#    slot order: running (N tabs), yours (· here), or, with a map, not started.
+#    Sessions without a slot follow under a rule, reachable by name only.
+sessions=$(tmux list-sessions -F $'#{session_id}\x1f#{session_name}\x1f#{session_windows}' |
+  LC_ALL=C awk -F $'\x1f' -v OFS='\t' '{ gsub(/\t/, " "); print $1, $2, $3 " tab" ($3 == 1 ? "" : "s") }')
+slots=$(bh_map_rows)
+rows=$(LC_ALL=C awk -F '\t' -v OFS='\t' -v src="$session" -v dim="$dim" -v rst="$rst" "$BH_AWK_WIDTH"'
+  FILENAME == ARGV[1] { if (NF) { id[$2] = $1; tabs[$2] = $3 } next }
+  !NF { next }
+  !($2 in id) { if ($4 == 1) print "new", $1, dim " " $1 "  " pad($2, 17) "not started" rst; next }
+  id[$2] == src { print "here", $1, dim " " $1 "  " pad($2, 17) "· here" rst; next }
+  { print id[$2], $1, " " $1 "  " pad($2, 17) tabs[$2] }
+' <(printf '%s\n' "$sessions") <(printf '%s\n' "$slots"))
+others=$(LC_ALL=C awk -F '\t' -v OFS='\t' -v src="$session" "$BH_AWK_WIDTH"'
+  FILENAME == ARGV[1] { if (NF) slotted[$2] = 1; next }
+  NF && $1 != src && !($2 in slotted) { print $1, "", "    " pad($2, 17) $3 }
+' <(printf '%s\n' "$slots") <(printf '%s\n' "$sessions"))
+list=$rows
+if [ -n "$others" ]; then
+  [ -z "$list" ] || list+=$'\n'"skip${TAB}${TAB}${dim}    ──${rst}"$'\n'
+  list+=$others
+fi
+
+step2_header
+# A popup too narrow for the whole line (a small terminal) puts the reminder
+# on a second line, so the keys are never the part cut off.
+pcols=''
+read -r _ pcols < <(stty size </dev/tty 2>/dev/null) || true
+case $pcols in '' | *[!0-9]*) pcols=999 ;; esac
+if [ -n "$hinted" ] && [ $((${#header} + 3)) -gt "$pcols" ]; then
+  printf -v header '%s\n%s' "${header% · *}" "${header##* · }"
+fi
+
+out=$(pick --ansi --with-nth=3 --expect="$stay,0,1,2,3,4,5,6,7,8,9" \
+  --prompt="move $label to › " --header="$header" <<<"$list") || exit 0
+key=${out%%$'\n'*} choice=
+case $out in *$'\n'*) choice=${out#*$'\n'} ;; esac
+choice=${choice%%$'\n'*}
+case $key in
+  [0-9])
+    choice=$(LC_ALL=C awk -F '\t' -v s="$key" '$2 == s { print; exit }' <<<"$list")
+    key=
+    ;;
+esac
+[ -n "$choice" ] || exit 0
+dest=${choice%%"$TAB"*}
+slot=${choice#*"$TAB"}
+slot=${slot%%"$TAB"*}
+
+placeholder='' started=''
+case $dest in
+  skip) exit 0 ;;
+  here)
+    say "Already here"
+    exit 0
+    ;;
+  new)
+    row=$(LC_ALL=C awk -F '\t' -v s="$slot" '$1 == s { print; exit }' <<<"$slots")
+    name=$(LC_ALL=C awk -F '\t' '{ print $2 }' <<<"$row")
+    dir=$(LC_ALL=C awk -F '\t' '{ print $3 }' <<<"$row")
+    started=" (started)"
+    if [ ! -d "$dir" ]; then
+      dir=$HOME
+      started=" (started in ~)"
+    fi
+    made=$(tmux new-session -d -s "$name" -c "$dir" -P -F $'#{session_id}\x1f#{window_id}' 2>/dev/null) || {
+      say "bellhop move: couldn't start $name"
+      exit 1
+    }
+    dest=${made%%$'\x1f'*} placeholder=${made#*$'\x1f'}
+    ;;
+  *) name=$(tmux display-message -p -t "$dest" '#{session_name}') ;;
+esac
+
+# You go with the tabs unless you asked to stay. Moving every tab ends this
+# session, so then everyone attached to it goes along; otherwise their
+# terminals would detach.
+follow=1
+if [ "$key" = "$stay" ]; then follow=''; fi
+if [ "$count" -eq "$total" ]; then
+  follow=1
+  while IFS= read -r c; do
+    [ -z "$c" ] || tmux switch-client -c "$c" -t "$dest"
+  done < <(tmux list-clients -t "$session" -F '#{client_name}')
+fi
+
+# After the last tab (a bare "session:" would fill the first gap instead).
+for id in "${moving[@]}"; do tmux move-window -d -a -s "$id" -t "$dest:{end}"; done
+[ -z "$placeholder" ] || tmux kill-window -t "$placeholder"
+
+if [ -n "$follow" ]; then
+  tmux select-window -t "${moving[0]}"
+  tmux switch-client -c "$client" -t "$dest"
+fi
+say "Moved $label → $name$started"

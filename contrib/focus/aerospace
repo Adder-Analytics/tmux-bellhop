@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# contrib/focus/aerospace: an UNSUPPORTED example focus adapter for the
+# AeroSpace window manager on macOS. It is not tested in CI and may break when
+# AeroSpace changes; copy it and adapt it to your setup.
+#
+# It assumes one AeroSpace workspace per map slot, named by the digit, with the
+# terminal window that shows that slot's tmux session on it. Given a slot, it
+# switches to that workspace and focuses the terminal window there.
+#
+# Use it with:
+#   set -g @bellhop-focus-cmd '/path/to/tmux-bellhop/contrib/focus/aerospace'
+#
+# The focus-adapter contract (docs/configuration.md → "Focus adapters"):
+#   aerospace <slot-or-empty> <session_name> <window_id>
+#   exit 0  a terminal already showing that session is now focused; jump stops
+#   else    jump switches your tmux client instead
+# It gets 2 seconds; its output is discarded. BELLHOP_TMUX names the tmux binary.
+#
+# Environment:
+#   BELLHOP_TERMINAL_APP  the terminal's bundle id (default com.mitchellh.ghostty)
+#   BELLHOP_AEROSPACE     the aerospace binary (default: aerospace on PATH; a
+#                         tmux server's PATH can be thin, so set it if needed)
+set -uo pipefail
+
+slot=${1:-}
+app=${BELLHOP_TERMINAL_APP:-com.mitchellh.ghostty}
+bin=${BELLHOP_AEROSPACE:-aerospace}
+case $bin in */*) ;; *) bin=$(type -P "$bin" 2>/dev/null || true) ;; esac
+
+# No slot (a session off the map) or no AeroSpace: let jump switch the client.
+[ -n "$slot" ] || exit 1
+[ -n "$bin" ] && [ -x "$bin" ] || exit 1
+
+"$bin" workspace "$slot" >/dev/null 2>&1 || exit 1
+win=$("$bin" list-windows --workspace "$slot" --app-bundle-id "$app" --format '%{window-id}' 2>/dev/null |
+  LC_ALL=C awk 'NR == 1')
+[ -n "$win" ] || exit 1
+"$bin" focus --window-id "$win" >/dev/null 2>&1 || exit 1
+exit 0

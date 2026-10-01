@@ -1,0 +1,575 @@
+#!/usr/bin/env bash
+# bellhop-layout: `bellhop save` and `bellhop restore` (bin/bellhop runs this
+# with the subcommand as $1).
+#
+#   save     snapshot every session's tabs, their folders and their Claude Code
+#            session ids to <state>/<socket>/layout. The tmux hooks and the
+#            Claude Code hook run it with --from-hook, in bursts: those saves
+#            coalesce through layout.pending, and the last one is never lost.
+#   restore  after a reboot, bring the saved sessions back: print the plan, ask,
+#            start each session that is not running with its tabs in order on
+#            their folders, and type (never run) `claude --resume <id>` in each
+#            tab that had a Claude.
+#
+# Layout file v1 (mode 600, in a mode 700 directory): the header
+#   # bellhop layout 1 <epoch> <server-id>
+# then one tab-separated line per tab:
+#   slot session index name path claude_session state window_id ended autorename
+# claude_session is kept after its Claude ends, with `ended` stamped, because at
+# a shutdown the Claudes can end (and save) before tmux goes. autorename is 1
+# when tmux named the tab, 0 when someone named it by hand.
+#
+# Beside it: layout.prev (the previous server's layout, handed over by the
+# first save of a new server), layout.restored (a layout already restored),
+# layout.lock and layout.pending (saves), restore.lock (restores).
+#
+# bash 3.2 compatible.
+set -euo pipefail
+
+# The plugin folder, through any symlink (bh_realpath lives below it).
+_self=$0
+_n=0
+while [ -L "$_self" ] && [ "$_n" -lt 40 ]; do
+  _l=$(readlink "$_self")
+  case $_l in
+    /*) _self=$_l ;;
+    *) _self=$(dirname "$_self")/$_l ;;
+  esac
+  _n=$((_n + 1))
+done
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$_self")/.." && pwd -P)
+BH_CMD=${1:-layout}
+# shellcheck source=../lib/bellhop/common.sh
+. "$ROOT/lib/bellhop/common.sh"
+
+TAB=$'\t'
+US=$'\037'
+NL=$'\n'
+# A Claude Code session id; anything else is never typed into a shell.
+H='[0123456789abcdefABCDEF]'
+UUID_RE="^$H{8}-$H{4}-$H{4}-$H{4}-$H{12}\$"
+
+# -L NAME or --socket NAME (or a socket path): every tmux call goes to that
+# server. Without it, tmux follows $TMUX, else the default socket.
+SOCK=
+BH_TMUX_TARGET=()
+tmux() { command "${TMUX_BIN:-tmux}" ${BH_TMUX_TARGET[@]+"${BH_TMUX_TARGET[@]}"} "$@"; }
+
+usage_save() {
+  cat <<'EOF'
+usage: bellhop save [--from-hook] [-L SOCKET | --socket SOCKET]
+
+Snapshot every session's tabs, folders and Claude Code session ids for
+`bellhop restore`. tmux's hooks run it when tabs open and close, and the
+Claude Code hook when a Claude starts or ends; you rarely need to.
+
+  --from-hook       what the hooks run: never waits for another save, and does
+                    nothing when @bellhop-autosave is off
+  -L, --socket S    the tmux server to snapshot (default: this one, else default)
+  -h, --help        this help
+
+The layout is kept in ~/.local/state/bellhop/<socket>/layout (or under
+$XDG_STATE_HOME, or $BELLHOP_STATE_DIR). It always exits 0.
+EOF
+}
+
+usage_restore() {
+  cat <<'EOF'
+usage: bellhop restore [--dry-run] [--yes] [-L SOCKET | --socket SOCKET]
+
+After a reboot: start each saved session that is not running, with its tabs in
+order on their folders. It prints the plan first and asks before it starts
+anything. A tab that had a Claude gets `claude --resume <id>` typed but not
+run: press Enter in it to resume. A running session is never merged into.
+
+  --dry-run         print the plan and stop
+  --yes             start without asking (needed when not on a terminal)
+  -L, --socket S    the tmux server to restore into, and whose layout to read
+                    (default: this one, else default)
+  -h, --help        this help
+
+Exit status: 0 done (or nothing to restore), 1 nothing saved or not confirmed,
+2 bad usage or no terminal to ask on.
+EOF
+}
+
+# parse_socket FLAG VALUE: the -L/--socket value, or usage and exit 2.
+parse_socket() {
+  if [ -z "${2:-}" ]; then
+    warn "$1 needs a socket name"
+    exit 2
+  fi
+  SOCK=$2
+}
+
+# Paths and the tmux target for SOCK. $BELLHOP_LAYOUT names the layout file
+# itself; its locks then sit beside it.
+setup_paths() {
+  if [ -n "$SOCK" ]; then
+    case $SOCK in
+      */*) BH_TMUX_TARGET=(-S "$SOCK") ;;
+      *) BH_TMUX_TARGET=(-L "$SOCK") ;;
+    esac
+  fi
+  if [ -n "${BELLHOP_LAYOUT:-}" ]; then
+    LAYOUT=$BELLHOP_LAYOUT
+  else
+    LAYOUT=$(bh_state_dir "$SOCK")/layout
+  fi
+  STATE=$(dirname -- "$LAYOUT")
+}
+
+# header_server LINE: the server id in a v1 header line, else nothing.
+header_server() {
+  local a='' b='' c='' f=''
+  read -r a b c _ _ f _ <<<"$1" || true
+  if [ "$a" = "#" ] && [ "$b" = bellhop ] && [ "$c" = layout ]; then printf '%s\n' "$f"; fi
+}
+
+# layout_server FILE: the server id in FILE's header, else nothing.
+layout_server() {
+  local h=''
+  [ -s "$1" ] || return 0
+  IFS= read -r h <"$1" 2>/dev/null || true
+  header_server "$h"
+}
+
+# ── save ─────────────────────────────────────────────────────────────────────
+# The sessions @bellhop-save-ignore (a tmux glob) leaves out, one per line.
+ignore_sessions() {
+  local g
+  g=$(bh_opt save-ignore)
+  [ -n "$g" ] || return 0
+  # Inside #{m:…}, a # , or } of the glob would end or split the format.
+  g=$(printf '%s' "$g" | LC_ALL=C sed 's/#/##/g; s/,/#,/g; s/}/#}/g')
+  tmux list-sessions -f "#{m:$g,#{session_name}}" -F '#{session_name}' 2>/dev/null || true
+}
+
+# One snapshot. Nothing here may fail the caller: a problem keeps the last
+# good layout. (Written for errexit on or off: every step is checked.)
+save_once() {
+  local srv now old='' same='' rows tmp
+  srv=$(bh_server_id || true)
+  [ -n "$srv" ] || return 0 # no server: keep the last snapshot
+  now=$(bh_now)
+  if [ -s "$LAYOUT" ]; then old=$(cat "$LAYOUT" 2>/dev/null || true); fi
+  if [ -n "$old" ] && [ "$(header_server "${old%%"$NL"*}")" = "$srv" ]; then same=$old; fi
+  # One line per window. Its Claude is the active pane's, else another pane's
+  # (a known session id first), and its path is that Claude's pane (Claude
+  # resumes by folder), else the active pane's. An id this server saw earlier
+  # and no longer shows is kept, stamped with when it ended.
+  rows=$(bh_panes --autorename | LC_ALL=C awk -F '\t' -v OFS='\t' -v now="$now" '
+    FILENAME == ARGV[1] { if (!/^#/ && $8 != "" && $6 != "") { pcs[$8] = $6; pend[$8] = $9 }; next }
+    FILENAME == ARGV[2] { if ($0 != "") skip[$0] = 1; next }
+    $2 in skip { next }
+    { w = $4; r = $15 != "" ? 3 + ($9 == 1) : $13 != "none" ? 1 + ($9 == 1) : 0 }
+    !(w in head) { order[++n] = w; head[w] = $1 OFS $2 OFS $5 OFS $6; rank[w] = -1; ar[w] = $17 }
+    $9 == 1 { path[w] = $11 }
+    r > rank[w] { rank[w] = r; cs[w] = $15; cl[w] = $13; cp[w] = $11 }
+    END {
+      for (i = 1; i <= n; i++) {
+        w = order[i]; end = ""
+        if (cs[w] == "" && (w in pcs)) { cs[w] = pcs[w]; end = pend[w] != "" ? pend[w] : now }
+        print head[w], (rank[w] > 0 ? cp[w] : path[w]), cs[w], cl[w], w, end, (ar[w] == 1 ? 1 : 0)
+      }
+    }' <(printf '%s\n' "$same") <(ignore_sessions) -) || rows=
+  # No tabs means no server (the last session closing, a shutdown): keep the
+  # last good snapshot rather than save an empty one.
+  [ -n "$rows" ] || return 0
+  # The first save from a new server (a tab opened after a reboot, before
+  # `bellhop restore`) would bury the old layout, so it moves to .prev first.
+  if [ -n "$old" ] && [ -z "$same" ]; then
+    tmp=$(mktemp "$LAYOUT.XXXXXX" 2>/dev/null) || return 0
+    if printf '%s\n' "$old" >"$tmp"; then
+      mv -f "$tmp" "$LAYOUT.prev" || rm -f "$tmp"
+    else
+      rm -f "$tmp"
+      return 0
+    fi
+  fi
+  tmp=$(mktemp "$LAYOUT.XXXXXX" 2>/dev/null) || return 0
+  if printf '# bellhop layout 1 %s %s\n%s\n' "$now" "$srv" "$rows" >"$tmp"; then
+    mv -f "$tmp" "$LAYOUT" || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+  return 0
+}
+
+# save_run [--from-hook] [AFTER]: snapshot under layout.lock, coalescing.
+# A hook save marks layout.pending and then tries the lock once: if another
+# save holds it, that save sees the mark and snapshots again, so the last
+# change of a burst is always saved. (Marking before trying closes the gap
+# where the holder's last look comes between our failed try and our mark.)
+# A plain save waits up to 10 s. AFTER, a function, runs once under the lock.
+save_run() {
+  local hook=${1:-} after=${2:-} lk=$LAYOUT.lock pend=$LAYOUT.pending
+  mkdir -p "$STATE" 2>/dev/null || return 0
+  bh_lock_open 9 "$lk" 2>/dev/null || return 0
+  if [ -n "$hook" ]; then
+    : >"$pend" 2>/dev/null || true
+    if ! bh_lock_nb 9 "$lk"; then
+      bh_unlock 9 "$lk" || true
+      return 0
+    fi
+  elif ! bh_lock 9 10 "$lk"; then
+    : >"$pend" 2>/dev/null || true # the holder saves once more for us
+    bh_unlock 9 "$lk" || true
+    return 0
+  fi
+  while :; do
+    while :; do
+      rm -f "$pend"
+      save_once
+      [ -e "$pend" ] || break
+    done
+    if [ -n "$after" ]; then
+      "$after" || true
+      after=
+    fi
+    bh_unlock 9 "$lk" || true
+    # A mark made after our last look and before the release: take it too.
+    [ -e "$pend" ] || break
+    bh_lock_open 9 "$lk" 2>/dev/null || break
+    if ! bh_lock_nb 9 "$lk"; then
+      bh_unlock 9 "$lk" || true
+      break
+    fi
+  done
+  return 0
+}
+
+save_main() {
+  local hook=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --from-hook) hook=1 ;;
+      -L | --socket)
+        parse_socket "$1" "${2:-}"
+        shift
+        ;;
+      -L?*) parse_socket -L "${1#-L}" ;;
+      --socket=*) parse_socket --socket "${1#--socket=}" ;;
+      -h | --help)
+        usage_save
+        exit 0
+        ;;
+      *)
+        warn "unknown argument: $1"
+        usage_save >&2
+        exit 2
+        ;;
+    esac
+    shift
+  done
+  setup_paths
+  if [ -n "$hook" ] && [ "$(bh_opt autosave on)" = off ]; then return 0; fi
+  umask 077
+  save_run "$hook"
+}
+
+# ── restore ──────────────────────────────────────────────────────────────────
+# After restore's own save: the pre-reboot layout has been restored, so it is
+# retired to .restored and a later restore can't bring back sessions closed
+# since. (Run under layout.lock, so no hook save can race it.)
+retire_prev() {
+  local srv
+  srv=$(bh_server_id || true)
+  if [ -s "$LAYOUT.prev" ] && [ "$(layout_server "$LAYOUT.prev")" != "$srv" ]; then
+    mv -f "$LAYOUT.prev" "$LAYOUT.restored" 2>/dev/null || true
+  fi
+}
+
+# wait_prompt WINDOW: true once its pane has drawn something (a prompt),
+# polled every 0.1 s for up to 3 s.
+wait_prompt() {
+  local k=0 s
+  while [ "$k" -lt 30 ]; do
+    s=$(tmux capture-pane -p -t "$1" 2>/dev/null || true)
+    case $s in *[![:space:]]*) return 0 ;; esac
+    sleep 0.1
+    k=$((k + 1))
+  done
+  return 1
+}
+
+# The planned tabs, parallel arrays indexed 0..NPLAN-1 (no mapfile, no
+# associative arrays: bash 3.2).
+P_SESS=() P_BASE=() P_NAME=() P_PATH=() P_CMD=() P_AR=() P_FIRST=() P_WIN=()
+NPLAN=0
+
+restore_main() {
+  local dry='' yes='' um src srv text when h1='' h2='' h3='' h4='' rest='' s sess row slot base first
+  local name path cs end ar cmd have_claude='' missing='' skipped='' late='' made=0 tabs=0 typed=0
+  local ans i win firsttab skip_cur='' started=0 tabs_made=0 noprompt=''
+  local cl note maprows
+  local -a sessions rows nm plan
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dry-run) dry=1 ;;
+      --yes) yes=1 ;;
+      -L | --socket)
+        parse_socket "$1" "${2:-}"
+        shift
+        ;;
+      -L?*) parse_socket -L "${1#-L}" ;;
+      --socket=*) parse_socket --socket "${1#--socket=}" ;;
+      -h | --help)
+        usage_restore
+        exit 0
+        ;;
+      *)
+        warn "unknown argument: $1"
+        usage_restore >&2
+        exit 2
+        ;;
+    esac
+    shift
+  done
+  setup_paths
+
+  # One restore at a time, for the whole run (never layout.lock: restore's own
+  # save takes that one, and the mkdir lock backend is not re-entrant).
+  if [ -z "$dry" ]; then
+    um=$(umask)
+    umask 077
+    mkdir -p "$STATE" 2>/dev/null || die "cannot create $(tildify "$STATE")"
+    bh_lock_open 8 "$STATE/restore.lock" 2>/dev/null || die "cannot open $(tildify "$STATE/restore.lock")"
+    umask "$um"
+    if ! bh_lock_nb 8 "$STATE/restore.lock"; then
+      warn "waiting for another bellhop restore to finish..."
+      bh_lock 8 60 "$STATE/restore.lock" || die "another bellhop restore is still running"
+    fi
+  fi
+
+  # Once this server has saved, the pre-reboot layout is the .prev one.
+  src=$LAYOUT
+  srv=$(bh_server_id || true)
+  if [ -s "$LAYOUT.prev" ] && [ -n "$srv" ] && [ "$(layout_server "$LAYOUT")" = "$srv" ]; then
+    src=$LAYOUT.prev
+  fi
+  [ -s "$src" ] || die "nothing saved in $(tildify "$LAYOUT")"
+  # Read once: each tab made below fires the save hooks, which rewrite it.
+  text=$(cat "$src")
+  read -r h1 h2 h3 h4 when rest <<<"${text%%"$NL"*}" || true
+  [ "$h1 $h2 $h3 $h4" = "# bellhop layout 1" ] ||
+    die "$(tildify "$src") is not a bellhop layout (version 1)"
+  case $when in '' | *[!0-9]*) when=0 ;; esac
+  echo "Layout saved $(bh_date "$when" '%a %-d %b %H:%M')${dry:+ (dry run: nothing changes)}"
+
+  if command -v claude >/dev/null 2>&1; then have_claude=1; fi
+  # Sessions in the order the popups list them: numbered ones in map order,
+  # then the rest by name.
+  maprows=$(bh_map_rows)
+  sessions=()
+  while IFS= read -r s; do
+    [ -z "$s" ] || sessions[${#sessions[@]}]=$s
+  done < <(printf '%s\n' "$text" | LC_ALL=C awk -F '\t' -v OFS='\t' '
+      FILENAME == ARGV[1] { if (NF && !($2 in rank)) rank[$2] = FNR; next }
+      !/^#/ && NF && !seen[$2]++ { print (($2 in rank) ? rank[$2] : 99999), $2 }' \
+    <(printf '%s\n' "$maprows") - | LC_ALL=C sort -t "$TAB" -k1,1n -k2,2 | cut -f2-)
+
+  # The plan: every session that is not running, with its tabs.
+  for sess in ${sessions[@]+"${sessions[@]}"}; do
+    if tmux has-session -t "=$sess:" 2>/dev/null; then
+      skipped="$skipped${skipped:+ }$sess"
+      continue
+    fi
+    rows=()
+    while IFS= read -r row; do
+      rows[${#rows[@]}]=$row
+    done < <(printf '%s\n' "$text" | S=$sess LC_ALL=C awk -F '\t' '!/^#/ && $2 == ENVIRON["S"]')
+    # Home is the slot's folder on today's map, else where the first tab was.
+    slot=$(bh_slot_of_session "$sess")
+    base=
+    [ -z "$slot" ] || base=$(bh_slot_dir "$slot")
+    # (Tabs are whitespace to read, so an empty field would shift the rest.)
+    first=
+    IFS=$US read -r _ _ _ _ first _ <<<"${rows[0]//$TAB/$US}" || true
+    [ -n "$base" ] && [ -d "$base" ] || base=$first
+    [ -n "$base" ] && [ -d "$base" ] || base=$HOME
+    plan[${#plan[@]}]="  $sess${slot:+ (slot $slot)}  $(tildify "$base")"
+    firsttab=1
+    for row in "${rows[@]}"; do
+      name='' path='' cs='' cl='' end='' ar='' note=''
+      IFS=$US read -r _ _ _ name path cs cl _ end ar _ <<<"${row//$TAB/$US}" || true
+      # A Claude known only by its title (no hook, so no id): seen, not resumed.
+      if [ -z "$cs" ] && [ -n "$cl" ] && [ "$cl" != none ]; then note="  · Claude without a session id: nothing typed"; fi
+      [ -n "$path" ] && [ -d "$path" ] || path=$base # a deleted worktree
+      # An id whose Claude ended well before the last save was closed on purpose.
+      case $end in
+        '') ;;
+        *[!0-9]*) cs= ;;
+        *) [ $((10#$when - 10#$end)) -le 120 ] || cs= ;;
+      esac
+      cmd=
+      if [ -n "$cs" ] && [[ $cs =~ $UUID_RE ]]; then
+        if [ -n "$have_claude" ]; then cmd="claude --resume $cs"; else missing=1; fi
+      fi
+      # The tab name is padded when the whole plan is known (column width).
+      plan[${#plan[@]}]="$name$US$(tildify "$path")${cmd:+  · $cmd}$note"
+      P_SESS[NPLAN]=$sess P_BASE[NPLAN]=$base P_NAME[NPLAN]=$name P_PATH[NPLAN]=$path
+      P_CMD[NPLAN]=$cmd P_AR[NPLAN]=$ar P_FIRST[NPLAN]=$firsttab P_WIN[NPLAN]=
+      NPLAN=$((NPLAN + 1))
+      firsttab=
+      tabs=$((tabs + 1))
+      [ -z "$cmd" ] || typed=$((typed + 1))
+    done
+    made=$((made + 1))
+  done
+  # Tab names in one column, as wide as the longest (at least 20), counted in
+  # characters (a UTF-8 locale, in a subshell so nothing else sees it).
+  (
+    bh_locale || true
+    w=20
+    for row in ${plan[@]+"${plan[@]}"}; do
+      case $row in *"$US"*) name=${row%%"$US"*}; [ "${#name}" -le "$w" ] || w=${#name} ;; esac
+    done
+    for row in ${plan[@]+"${plan[@]}"}; do
+      case $row in
+        *"$US"*)
+          name=${row%%"$US"*}
+          pad=$((w - ${#name}))
+          printf '    %s%*s %s\n' "$name" "$pad" '' "${row#*"$US"}"
+          ;;
+        *) printf '%s\n' "$row" ;;
+      esac
+    done
+  )
+  [ -z "$skipped" ] || echo "  already running, left alone: $skipped"
+  [ -z "$missing" ] || echo "claude not found on PATH: nothing typed"
+
+  if [ "$made" -eq 0 ]; then
+    echo "Nothing to restore."
+    return 0
+  fi
+  if [ -n "$dry" ]; then
+    echo "Would start $(plural "$made" session), $(plural "$tabs" tab); $(plural "$typed" Claude) to resume."
+    return 0
+  fi
+  if [ -z "$yes" ]; then
+    if [ ! -t 0 ]; then
+      warn "no terminal to ask on; nothing started (--yes starts it without asking)"
+      exit 2
+    fi
+    printf 'Start %s, %s? [y/N] ' "$(plural "$made" session)" "$(plural "$tabs" tab)"
+    ans=
+    IFS= read -r ans || true
+    case $ans in
+      [yY] | [yY][eE][sS]) ;;
+      *)
+        echo "Nothing started."
+        exit 1
+        ;;
+    esac
+  fi
+
+  # Start the sessions and tabs. A session that started meanwhile is left alone.
+  i=0
+  while [ "$i" -lt "$NPLAN" ]; do
+    sess=${P_SESS[i]} base=${P_BASE[i]} name=${P_NAME[i]} path=${P_PATH[i]}
+    if [ -n "${P_FIRST[i]}" ]; then
+      skip_cur=
+      if tmux has-session -t "=$sess:" 2>/dev/null; then
+        skip_cur=1
+        late="$late $sess"
+      fi
+    fi
+    if [ -z "$skip_cur" ]; then
+      nm=()
+      [ -z "$name" ] || nm=(-n "${name//#/##}") # -n expands formats
+      win=
+      if [ -n "${P_FIRST[i]}" ]; then
+        # The session's own first tab; its folder (and so new tabs') is home.
+        # This may start the server, which must not inherit restore.lock: the
+        # fds are closed with exec first (a `cmd 8>&-` redirection lets bash
+        # keep a saved copy of the fd open across the exec).
+        if win=$(
+          exec 8>&- 9>&-
+          tmux new-session -d -s "$sess" -c "$base" ${nm[@]+"${nm[@]}"} -P -F '#{window_id}'
+        ); then
+          started=$((started + 1))
+          [ "$path" = "$base" ] || tmux respawn-pane -k -t "$win" -c "$path" || true
+        else
+          warn "could not start session $sess"
+          skip_cur=1
+          win=
+        fi
+      else
+        win=$(tmux new-window -d -t "=$sess:" -c "$path" ${nm[@]+"${nm[@]}"} -P -F '#{window_id}') || win=
+      fi
+      if [ -n "$win" ]; then
+        P_WIN[i]=$win
+        tabs_made=$((tabs_made + 1))
+        # -n froze the name. Where tmux had named the tab, a Claude's title (✳
+        # or a spinner) hands naming back to tmux; not the shell's title, which
+        # many shells set at every prompt. A name given by hand stays for good.
+        if [ -n "$name" ] && [ "${P_AR[i]}" = 1 ]; then
+          tmux set-hook -w -t "$win" pane-title-changed \
+            "if -F '#{m/r:✳|◐|◓|◑|◒,#{pane_title}}' 'set -w automatic-rename on; set-hook -wu pane-title-changed'" ||
+            true
+        fi
+      fi
+    fi
+    i=$((i + 1))
+  done
+
+  # Type each resume once its shell has drawn a prompt; never press Enter.
+  typed=0
+  i=0
+  while [ "$i" -lt "$NPLAN" ]; do
+    win=${P_WIN[i]}
+    if [ -n "$win" ] && [ -n "${P_CMD[i]}" ]; then
+      if wait_prompt "$win"; then
+        if tmux send-keys -t "$win" -l "${P_CMD[i]}"; then typed=$((typed + 1)); fi
+      else
+        noprompt="$noprompt ${P_SESS[i]}:${P_NAME[i]}"
+      fi
+    fi
+    i=$((i + 1))
+  done
+
+  # Save this server's layout (moving an unsaved pre-reboot one to .prev),
+  # then retire .prev: it has been restored.
+  um=$(umask)
+  umask 077
+  save_run '' retire_prev
+  umask "$um"
+  bh_unlock 8 "$STATE/restore.lock" || true
+
+  [ -z "$late" ] || echo "  started meanwhile, left alone:$late"
+  [ -z "$noprompt" ] || echo "  no prompt within 3 s, nothing typed in:$noprompt"
+  if [ "$started" -eq 0 ]; then
+    echo "Nothing to restore."
+  else
+    if [ "$typed" -gt 0 ]; then
+      echo "Started $(plural "$started" session), $(plural "$tabs_made" tab). $(plural "$typed" tab) with claude --resume typed: press Enter to resume."
+    else
+      echo "Started $(plural "$started" session), $(plural "$tabs_made" tab)."
+    fi
+  fi
+}
+
+case ${1:-} in
+  save)
+    shift
+    # Always exits 0: it runs from hooks, where a failure has nowhere to go.
+    if save_main "$@"; then :; fi
+    exit 0
+    ;;
+  restore)
+    shift
+    restore_main "$@"
+    ;;
+  -h | --help)
+    usage_save
+    echo
+    usage_restore
+    ;;
+  *)
+    usage_save >&2
+    echo >&2
+    usage_restore >&2
+    exit 2
+    ;;
+esac
