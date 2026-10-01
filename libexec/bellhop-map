@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# bellhop map: the numbered-session map. One line per slot, "<digit> <session>
+# [folder]"; the folder is the rest of the line, so it may hold spaces. Move's
+# digits and the slot column of the inbox and find come from it. Without a map
+# file, the running sessions are numbered 1-9, then 0, in list-sessions order.
+#
+#   bellhop map [list]                      the slots, running or not
+#   bellhop map init [--force]              write the map from running sessions
+#   bellhop map set <digit> [dir] [session] put a folder (default: here) on a slot
+#   bellhop map unset <digit>               take a slot off the map
+#   bellhop map edit                        $VISUAL, else $EDITOR, else vi
+#   bellhop map path                        where the map file is
+set -euo pipefail
+
+# The plugin folder, through any symlink (the dispatcher execs us by path).
+_self=$0
+_n=0
+while [ -L "$_self" ] && [ "$_n" -lt 40 ]; do
+  _l=$(readlink "$_self")
+  case $_l in
+    /*) _self=$_l ;;
+    *) _self=$(dirname "$_self")/$_l ;;
+  esac
+  _n=$((_n + 1))
+done
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$_self")/.." && pwd -P)
+# shellcheck source=../lib/bellhop/common.sh
+. "$ROOT/lib/bellhop/common.sh"
+BH_CMD=map
+
+usage() {
+  cat <<'EOF'
+usage: bellhop map [-L SOCKET] [list]
+       bellhop map [-L SOCKET] init [--force]
+       bellhop map set <digit> [dir] [session]
+       bellhop map unset <digit>
+       bellhop map edit
+       bellhop map path
+
+The map gives sessions the digits move uses (0-9). One line per slot:
+  <digit>  <session>  [folder]        # comment lines start with #
+The folder is the rest of the line (spaces are fine), ~ is your home, and it
+defaults to ~. A session name has no spaces, dots or colons. Without a map,
+your running sessions are numbered 1-9, then 0.
+
+  list            each slot: digit, session, folder, running or not started
+  init            number the running sessions into a new map (--force replaces one)
+  set             dir defaults to here; session defaults to the folder's name
+  unset           remove a slot
+  edit            open the map in $VISUAL, $EDITOR or vi (made from a template)
+  path            print the map file's path
+  -L, --socket S  the tmux server whose running sessions list and init read
+                  (default: this one, else default); the map itself is one
+                  file for every server
+
+The file: $BELLHOP_MAP, else ${XDG_CONFIG_HOME:-~/.config}/bellhop/map.
+EOF
+}
+
+MAP=$(bh_map_path)
+
+# -L NAME or --socket NAME (or a socket path), anywhere in the arguments: every
+# tmux call goes to that server. Without it, tmux follows $TMUX, else default.
+SOCK=''
+BH_TMUX_TARGET=()
+tmux() { command "${TMUX_BIN:-tmux}" ${BH_TMUX_TARGET[@]+"${BH_TMUX_TARGET[@]}"} "$@"; }
+_args=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -L | --socket)
+      [ -n "${2:-}" ] || { warn "$1 needs a socket name"; exit 2; }
+      SOCK=$2
+      shift
+      ;;
+    -L?*) SOCK=${1#-L} ;;
+    --socket=?*) SOCK=${1#--socket=} ;;
+    *) _args+=("$1") ;;
+  esac
+  shift
+done
+set -- ${_args[@]+"${_args[@]}"}
+case $SOCK in
+  '') ;;
+  */*) BH_TMUX_TARGET=(-S "$SOCK") ;;
+  *) BH_TMUX_TARGET=(-L "$SOCK") ;;
+esac
+# The server's name, for the output: "default", "work", ...
+SERVER=$(bh_socket_name "$SOCK")
+
+template() {
+  cat <<'EOF'
+# bellhop session map: the digits `prefix m` (move) and the inbox show.
+# One line per slot:  <digit>  <session>  [folder]
+#   digit    0-9, each once
+#   session  a tmux session name, with no spaces, dots or colons
+#   folder   the rest of the line (spaces are fine); ~ is your home; default ~
+# A slot whose session is not running is started in its folder by move.
+#
+# 1  api    ~/src/api
+# 2  web    ~/src/web
+EOF
+}
+
+# Write stdin to the map, atomically: a temp file in the same folder, then mv.
+# An existing map keeps its mode (the temp file starts as a cp -p of it). A
+# symlinked map is written through to its target, so the link stays a link.
+write_map() {
+  local dir tmp real=$MAP
+  if [ -L "$MAP" ]; then
+    real=$(bh_realpath "$MAP" 2>/dev/null) ||
+      die "$(tildify "$MAP") is a link that points to a missing folder ($(readlink -- "$MAP"))"
+  fi
+  dir=$(dirname -- "$real")
+  mkdir -p -- "$dir"
+  tmp=$(mktemp "$dir/.map.XXXXXX")
+  if [ -f "$real" ]; then cp -p -- "$real" "$tmp"; fi
+  if ! cat >"$tmp" || ! mv -f -- "$tmp" "$real"; then
+    rm -f -- "$tmp"
+    die "could not write $(tildify "$MAP")"
+  fi
+}
+
+# "running<TAB>N" per running session, from one tmux call (nothing without a server).
+running_sessions() {
+  tmux list-sessions -F $'#{session_name}\x1f#{session_windows}' 2>/dev/null |
+    LC_ALL=C awk -F $'\x1f' -v OFS='\t' '{ print $1, $2 }' || true
+}
+
+cmd_list() {
+  local rows run
+  [ $# -eq 0 ] || { usage >&2; exit 2; }
+  if [ -f "$MAP" ]; then
+    echo "map: $(tildify "$MAP") · running on the tmux server $SERVER"
+  else
+    echo "no map file ($(tildify "$MAP")): the sessions running on the tmux server $SERVER are numbered in order"
+    echo "  (bellhop map init writes them down; bellhop map set <digit> pins one)"
+  fi
+  rows=$(bh_map_rows --warn)
+  run=$(running_sessions)
+  if [ -z "$rows" ]; then
+    if [ -f "$MAP" ]; then echo "  (no slots)"; else echo "  (no running sessions)"; fi
+    return 0
+  fi
+  # digit · session · folder · running, N tabs | not started
+  { printf '%s\n' "$run"; printf '%s\n' "--"; printf '%s\n' "$rows"; } |
+    LC_ALL=C awk -F '\t' -v home="$HOME" "$BH_AWK_WIDTH"'
+      function tild(p) {
+        if (p == home) return "~"
+        if (substr(p, 1, length(home) + 1) == home "/") return "~" substr(p, length(home) + 1)
+        return p
+      }
+      !rows && $0 == "--" { rows = 1; next }
+      !rows { if ($1 != "") n[$1] = $2; next }
+      $0 != "" { d[++k] = $1; s[k] = $2; f[k] = tild($3)
+        if (ulen($2) > ws) ws = ulen($2)
+        if (ulen(f[k]) > wf) wf = ulen(f[k]) }
+      END {
+        if (ws > 24) ws = 24
+        if (wf > 40) wf = 40
+        for (i = 1; i <= k; i++) {
+          st = (s[i] in n) ? "running, " n[s[i]] (n[s[i]] == 1 ? " tab" : " tabs") : "not started"
+          printf "  %s  %s %s %s\n", d[i], pad(s[i], ws), pad(f[i], wf), st
+        }
+      }'
+}
+
+cmd_path() {
+  [ $# -eq 0 ] || { usage >&2; exit 2; }
+  printf '%s\n' "$MAP"
+}
+
+# A slot line for the map, or a reason on stderr and status 2.
+valid_digit() {
+  case ${1:-} in
+    [0-9]) return 0 ;;
+  esac
+  warn "the slot must be one digit, 0-9 (got \"${1:-}\")"
+  return 2
+}
+
+valid_session() {
+  local s=${1:-}
+  case $s in
+    '' | *[[:space:]]* | *.* | *:*)
+      warn "bad session name \"$s\": no spaces, dots or colons (tmux would rename it)"
+      return 2
+      ;;
+  esac
+}
+
+cmd_init() {
+  local force='' lines skipped='' n=0 name path
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --force) force=1 ;;
+      -h | --help) usage; exit 0 ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    shift
+  done
+  if [ -f "$MAP" ] && [ -z "$force" ]; then
+    die "$(tildify "$MAP") already exists; bellhop map init --force replaces it"
+  fi
+  lines=
+  while IFS=$'\x1f' read -r name path; do
+    [ -n "$name" ] || continue
+    if ! valid_session "$name" 2>/dev/null; then
+      skipped="$skipped${skipped:+, }$name"
+      continue
+    fi
+    [ "$n" -lt 10 ] || break
+    n=$((n + 1))
+    [ -n "$path" ] || path=$HOME
+    lines="$lines$((n % 10))  $name  $(tildify "$path")"$'\n'
+  done < <(tmux list-sessions -F $'#{session_name}\x1f#{session_path}' 2>/dev/null || true)
+  [ "$n" -gt 0 ] || die "no sessions running on the tmux server $SERVER to number; start some, or use bellhop map set <digit> [dir]"
+  { template; echo; printf '%s' "$lines"; } | write_map
+  echo "wrote $(tildify "$MAP") with $(plural "$n" slot), from the sessions on the tmux server $SERVER:"
+  printf '%s' "$lines" | LC_ALL=C awk '{ print "  " $0 }'
+  if [ -n "$skipped" ]; then
+    warn "left off (a name with spaces can't be a slot): $skipped"
+  fi
+}
+
+# The map with every line for DIGIT removed, plus NEWLINE when given: the
+# comment lines first, as they were, then the slot lines in digit order.
+rewrite() {
+  local digit=$1 new=${2:-} src com body
+  if [ -f "$MAP" ]; then src=$(cat -- "$MAP"); else src=$(template); fi
+  com=$(printf '%s\n' "$src" | LC_ALL=C awk '{ sub(/\r$/, "") } /^[ \t]*#/')
+  body=$(
+    {
+      printf '%s\n' "$src" | LC_ALL=C awk -v d="$digit" '
+        { sub(/\r$/, "") }
+        /^[ \t]*#/ || /^[ \t]*$/ { next }
+        $1 != d'
+      [ -z "$new" ] || printf '%s\n' "$new"
+    } | LC_ALL=C sort -s -k1,1n
+  )
+  [ -z "$com" ] || printf '%s\n' "$com"
+  [ -z "$com" ] || [ -z "$body" ] || echo
+  [ -z "$body" ] || printf '%s\n' "$body"
+}
+
+cmd_set() {
+  local digit=${1:-} dir=${2:-} name=${3:-} shown line
+  [ $# -ge 1 ] && [ $# -le 3 ] || { usage >&2; exit 2; }
+  valid_digit "$digit" || exit 2
+  [ -n "$dir" ] || dir=$PWD
+  case $dir in
+    \~) dir=$HOME ;;
+    \~/*) dir=$HOME/${dir#\~/} ;;
+  esac
+  if [ -d "$dir" ]; then
+    dir=$(CDPATH='' cd -- "$dir" && pwd)
+  else
+    case $dir in /*) ;; *) dir=$PWD/$dir ;; esac
+    warn "note: $(tildify "$dir") does not exist yet; move starts slot $digit in ~ until it does"
+  fi
+  case $dir in
+    *$'\n'* | *[[:space:]])
+      warn "the folder can't hold a line break or end in a space"
+      exit 2
+      ;;
+  esac
+  [ -n "$name" ] || name=$(session_name "$dir")
+  valid_session "$name" || exit 2
+  shown=$(tildify "$dir")
+  line="$digit  $name  $shown"
+  rewrite "$digit" "$line" | write_map
+  echo "slot $digit: $name  $shown  ($(tildify "$MAP"))"
+}
+
+cmd_unset() {
+  local digit=${1:-}
+  [ $# -eq 1 ] || { usage >&2; exit 2; }
+  valid_digit "$digit" || exit 2
+  if [ ! -f "$MAP" ] || ! LC_ALL=C awk -v d="$digit" '!/^[ \t]*#/ && $1 == d { f = 1 } END { exit !f }' "$MAP"; then
+    echo "slot $digit is not on the map"
+    return 0
+  fi
+  rewrite "$digit" | write_map
+  echo "slot $digit removed ($(tildify "$MAP"))"
+}
+
+cmd_edit() {
+  local ed
+  [ $# -eq 0 ] || { usage >&2; exit 2; }
+  [ -f "$MAP" ] || template | write_map
+  ed=${VISUAL:-${EDITOR:-vi}}
+  # $VISUAL may carry flags ("code -w"): split into words on purpose, no globbing.
+  set -f
+  # shellcheck disable=SC2086
+  $ed "$MAP" || die "the editor ($ed) exited with an error"
+  set +f
+  # Say what list would skip, now, rather than at the next popup.
+  bh_map_rows --warn >/dev/null
+}
+
+sub=${1:-list}
+[ $# -eq 0 ] || shift
+case $sub in
+  list) cmd_list "$@" ;;
+  init) cmd_init "$@" ;;
+  set) cmd_set "$@" ;;
+  unset) cmd_unset "$@" ;;
+  edit) cmd_edit "$@" ;;
+  path) cmd_path "$@" ;;
+  -h | --help | help) usage ;;
+  *)
+    warn "unknown subcommand \`$sub\`"
+    usage >&2
+    exit 2
+    ;;
+esac

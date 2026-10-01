@@ -1,0 +1,557 @@
+#!/usr/bin/env bash
+# bellhop doctor: is everything in place? One line per check (ok, warn, fail or
+# skip), each warn and fail followed by the fix. Exit 1 when anything fails.
+# Paths are shown from ~ so the output can be pasted into an issue.
+#
+#   bellhop doctor        every check
+#   bellhop doctor --ci   only what needs no tmux server, no Claude Code
+#                         settings and no PATH link: versions, awk, lock
+#                         backend, locale, state folder and the map
+set -euo pipefail
+
+_self=$0
+_n=0
+while [ -L "$_self" ] && [ "$_n" -lt 40 ]; do
+  _l=$(readlink "$_self")
+  case $_l in
+    /*) _self=$_l ;;
+    *) _self=$(dirname "$_self")/$_l ;;
+  esac
+  _n=$((_n + 1))
+done
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$_self")/.." && pwd -P)
+# shellcheck source=../lib/bellhop/common.sh
+. "$ROOT/lib/bellhop/common.sh"
+BH_CMD=doctor
+
+usage() {
+  cat <<'EOF'
+usage: bellhop doctor [--ci] [-L SOCKET | --socket SOCKET]
+
+Checks the install, one line per check: ok, warn or fail, and a fix line under
+each warning and failure. Exits 1 when a check fails.
+
+  --ci              only the checks that need no tmux server, no Claude Code
+                    settings and no PATH link (versions, awk, lock backend,
+                    locale, state folder, map)
+  -L, --socket S    the tmux server to check (default: this one, else default)
+
+Paste the output into a bug report as it is: paths are shown from ~.
+EOF
+}
+
+# -L NAME or --socket NAME (or a socket path): every tmux call goes to that
+# server. Without it, tmux follows $TMUX, else the default socket.
+SOCK=''
+BH_TMUX_TARGET=()
+tmux() { command "${TMUX_BIN:-tmux}" ${BH_TMUX_TARGET[@]+"${BH_TMUX_TARGET[@]}"} "$@"; }
+
+CI=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    --ci) CI=1 ;;
+    -L | --socket)
+      [ -n "${2:-}" ] || { warn "$1 needs a socket name"; exit 2; }
+      SOCK=$2
+      shift
+      ;;
+    -L?*) SOCK=${1#-L} ;;
+    --socket=?*) SOCK=${1#--socket=} ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      warn "unknown option \`$1\`"
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+case $SOCK in
+  '') ;;
+  */*) BH_TMUX_TARGET=(-S "$SOCK") ;;
+  *) BH_TMUX_TARGET=(-L "$SOCK") ;;
+esac
+
+FAILS=0
+# res STATUS TEXT [FIX]
+res() {
+  printf '%-5s %s\n' "$1" "$2"
+  if [ "$1" != ok ] && [ "$1" != skip ] && [ -n "${3:-}" ]; then
+    printf '      fix: %s\n' "$3"
+  fi
+  [ "$1" != fail ] || FAILS=$((FAILS + 1))
+  return 0
+}
+t() { tildify "$1"; }
+
+# "4m", "2h", "3d" from seconds.
+ago() {
+  local s=$1
+  if [ "$s" -lt 60 ]; then
+    echo "${s}s"
+  elif [ "$s" -lt 3600 ]; then
+    echo "$((s / 60))m"
+  elif [ "$s" -lt 86400 ]; then
+    echo "$((s / 3600))h"
+  else
+    echo "$((s / 86400))d"
+  fi
+}
+
+# ── versions ─────────────────────────────────────────────────────────────────
+check_bellhop() {
+  local v
+  v=$(cat "$ROOT/VERSION" 2>/dev/null || echo "?")
+  res ok "bellhop $v in $(t "$ROOT")"
+}
+
+check_tmux() {
+  local v num
+  if [ -z "${TMUX_BIN:-}" ] || ! v=$(tmux -V 2>/dev/null); then
+    res fail "tmux: not found" "install tmux $BH_TMUX_MIN or newer (macOS: brew install tmux · Debian/Ubuntu: sudo apt install tmux)"
+    return 0
+  fi
+  num=$(printf '%s\n' "$v" | LC_ALL=C awk '{ if (match($0, /[0-9]+\.[0-9]+/)) print substr($0, RSTART, RLENGTH) }')
+  if [ -z "$num" ]; then
+    res ok "$v (a development build)"
+  elif bh_version_ge "$num" "$BH_TMUX_MIN"; then
+    res ok "$v (needs $BH_TMUX_MIN)"
+  else
+    res fail "$v is older than $BH_TMUX_MIN: the keys are not bound" \
+      "install tmux $BH_TMUX_MIN or newer (Ubuntu 22.04's 3.2a is too old)"
+  fi
+}
+
+check_fzf() {
+  local v bin
+  bin=${BELLHOP_FZF:-fzf}
+  v=$(bh_fzf_version || true)
+  if [ -z "$v" ]; then
+    res fail "fzf: not found ($bin)" "install fzf $BH_FZF_MIN or newer (brew install fzf, or the release binary from github.com/junegunn/fzf)"
+  elif bh_version_ge "$v" "$BH_FZF_MIN"; then
+    res ok "fzf $v (needs $BH_FZF_MIN)"
+  else
+    res fail "fzf $v is older than $BH_FZF_MIN: the popups won't open" \
+      "install fzf $BH_FZF_MIN or newer (the release binary from github.com/junegunn/fzf)"
+  fi
+}
+
+check_bash() {
+  local v="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}.${BASH_VERSINFO[2]}" p
+  p=$(bh_realpath "${BASH:-bash}" 2>/dev/null || printf '%s' "${BASH:-bash}")
+  if bh_version_ge "$v" 3.2; then
+    res ok "bash $v ($(t "$p"))"
+  else
+    res fail "bash $v ($(t "$p")) is older than 3.2" "install a newer bash and put it first on PATH"
+  fi
+}
+
+check_jq() {
+  local jq v
+  jq=${BELLHOP_JQ:-jq}
+  case $jq in */*) ;; *) jq=$(type -P "$jq" 2>/dev/null || true) ;; esac
+  if [ -z "$jq" ] || [ ! -x "$jq" ]; then
+    res warn "jq: not found (only bellhop hook install and uninstall need it)" \
+      "install jq (macOS: brew install jq · Debian/Ubuntu: sudo apt install jq)"
+    return 0
+  fi
+  v=$("$jq" --version 2>/dev/null || true)
+  v=${v#jq-}
+  if [ -n "$v" ] && ! bh_version_ge "$v" 1.6; then
+    res warn "jq $v is older than 1.6" "install jq 1.6 or newer"
+  else
+    res ok "jq ${v:-(version unknown)}"
+  fi
+}
+
+check_awk() {
+  local v flavour
+  v=$(awk --version </dev/null 2>&1 | LC_ALL=C awk 'NR == 1' || true)
+  case $v in
+    *GNU*) flavour=gawk ;;
+    *mawk*) flavour=mawk ;;
+    *"awk version"*) flavour=bsd ;;
+    *)
+      v=$(awk -W version </dev/null 2>&1 | LC_ALL=C awk 'NR == 1' || true)
+      case $v in
+        *mawk*) flavour=mawk ;;
+        *BusyBox*) flavour=busybox ;;
+        *) flavour='' ;;
+      esac
+      ;;
+  esac
+  if [ -n "$flavour" ]; then
+    res ok "awk: $flavour"
+  else
+    res warn "awk: an unknown flavour (bellhop is tested on bsd, mawk and gawk)" \
+      "if columns look wrong, put gawk or mawk first on PATH as awk"
+  fi
+}
+
+check_lock() {
+  local b
+  b=$(bh_lock_backend 2>/dev/null || true)
+  if [ -n "${BELLHOP_LOCK:-}" ]; then
+    res ok "lock backend: $b (forced by BELLHOP_LOCK)"
+  elif [ -n "$b" ]; then
+    res ok "lock backend: $b"
+  else
+    res warn "lock backend: none could be picked" "check that $(t "$(bh_state_root)") is writable"
+  fi
+}
+
+check_locale() {
+  local cur picked
+  cur=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
+  case $cur in
+    *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*)
+      res ok "locale: $cur"
+      return 0
+      ;;
+  esac
+  if picked=$(bh_locale && printf '%s' "${LC_CTYPE:-}"); then
+    res ok "locale: ${cur:-unset}, so bellhop uses $picked"
+  else
+    res warn "locale: ${cur:-unset} and no UTF-8 locale installed: names with accents or symbols may misalign" \
+      "install a UTF-8 locale (Debian/Ubuntu: sudo apt install locales && sudo locale-gen C.UTF-8)"
+  fi
+}
+
+# ── tmux server ──────────────────────────────────────────────────────────────
+SERVER=''
+check_inside() {
+  if [ -n "$SOCK" ]; then
+    res ok "checking the server $(bh_socket_name "$SOCK") (-L)"
+  elif [ -n "${TMUX:-}" ]; then
+    res ok "inside tmux (server $(bh_socket_name))"
+  else
+    res warn "not inside tmux: the checks below look at the default server" \
+      "run bellhop doctor in a tmux pane, or name the server: bellhop doctor -L NAME"
+  fi
+  if tmux list-sessions >/dev/null 2>&1; then SERVER=1; fi
+}
+
+SROOT=''
+check_plugin() {
+  SROOT=$(bh_opt @bellhop-root)
+  if [ -z "$SROOT" ]; then
+    res fail "plugin: not loaded on this server" \
+      "add \`run-shell $(t "$ROOT")/bellhop.tmux\` (or the TPM @plugin line) to tmux.conf, then: tmux source-file ~/.tmux.conf"
+  elif [ "$SROOT" != "$ROOT" ]; then
+    res warn "plugin: loaded from $(t "$SROOT"), but this bellhop is $(t "$ROOT")" \
+      "run $(t "$SROOT")/bin/bellhop, or load this copy instead"
+  else
+    res ok "plugin: loaded from $(t "$SROOT")"
+  fi
+}
+
+# The key a list-keys line binds (as bind-key takes it).
+key_of() {
+  local k
+  k=$(printf '%s\n' "$1" | LC_ALL=C awk '{ i = ($2 == "-r") ? 5 : 4; print $i }')
+  case $k in
+    \\?*) k=${k#\\} ;;
+    \'*\') k=${k#\'} k=${k%\'} ;;
+    \"*\") k=${k#\"} k=${k%\"} ;;
+  esac
+  printf '%s' "$k"
+}
+
+check_keys() {
+  local keys skipped tool def key line bound opt root
+  root=${SROOT:-$ROOT}
+  keys=$(tmux list-keys -T prefix 2>/dev/null || true)
+  skipped=" $(bh_opt @bellhop-skipped) "
+  for tool in inbox:i find:/ move:m; do
+    def=${tool#*:} tool=${tool%%:*}
+    opt=@bellhop-$tool-key
+    if bh_opt_set "$opt"; then key=$(bh_opt "$opt"); else key=$def; fi
+    if [ -z "$key" ]; then
+      res ok "$tool: no key ($opt is '')"
+      continue
+    fi
+    bound=''
+    while IFS= read -r line; do
+      case $line in
+        *"'${root//\#/##}/bin/bellhop' $tool "*) # a '#' is bound as '##'
+          bound=$(key_of "$line")
+          break
+          ;;
+      esac
+    done <<<"$keys"
+    if [ -n "$bound" ]; then
+      res ok "$tool: prefix $bound"
+    else
+      case $skipped in
+        *" $key "*)
+          res warn "$tool: not bound, because prefix $key already does something else (your binding was kept)" \
+            "pick a free key: set -g $opt <key> in tmux.conf, then tmux source-file ~/.tmux.conf"
+          ;;
+        *)
+          res warn "$tool: prefix $key is not bound to bellhop" "reload the plugin: tmux source-file ~/.tmux.conf"
+          ;;
+      esac
+    fi
+  done
+}
+
+check_bell() {
+  local v
+  v=$(tmux show-options -gwv monitor-bell 2>/dev/null || true)
+  if [ "$v" = off ]; then
+    res warn "monitor-bell is off: a Claude that finishes never shows as finished" "set -g monitor-bell on"
+  else
+    res ok "monitor-bell ${v:-on}"
+  fi
+}
+
+check_save_hooks() {
+  local h n=0
+  if [ "$(bh_opt autosave on)" = off ]; then
+    res ok "save hooks: off (@bellhop-autosave off; restore has nothing new to bring back)"
+    return 0
+  fi
+  for h in after-new-window window-unlinked session-closed; do
+    case $(tmux show-hooks -g "${h}[77]" 2>/dev/null || true) in
+      *bellhop*) n=$((n + 1)) ;;
+    esac
+  done
+  if [ "$n" -eq 3 ]; then
+    res ok "save hooks: 3 at [77]"
+  else
+    res warn "save hooks: $n of 3 at [77]; restore may miss recent tabs" "reload the plugin: tmux source-file ~/.tmux.conf"
+  fi
+}
+
+# ── state and map ────────────────────────────────────────────────────────────
+check_state() {
+  local dir probe layout head epoch now saved up ok=''
+  dir=$(bh_state_dir "$SOCK")
+  # Checked without leaving anything behind: an existing folder gets a probe
+  # file (removed at once); a missing one is checked on the nearest folder
+  # above it that exists, since the first save creates the rest.
+  if [ -d "$dir" ]; then
+    if probe=$(mktemp "$dir/.doctor.XXXXXX" 2>/dev/null); then
+      rm -f -- "$probe"
+      ok=1
+    fi
+  else
+    up=$dir
+    while [ ! -e "$up" ] && [ "$up" != / ] && [ "$up" != . ]; do up=$(dirname -- "$up"); done
+    if [ -d "$up" ] && [ -w "$up" ] && [ -x "$up" ]; then ok=1; fi
+  fi
+  if [ -z "$ok" ]; then
+    res fail "state folder $(t "$dir") is not writable: nothing can be saved for restore" \
+      "check the permissions of $(t "$dir") (or set BELLHOP_STATE_DIR)"
+    return 0
+  fi
+  layout=${BELLHOP_LAYOUT:-$dir/layout}
+  saved="no layout saved yet"
+  if [ -f "$layout" ]; then
+    IFS= read -r head <"$layout" 2>/dev/null || head=
+    epoch=$(printf '%s\n' "$head" | LC_ALL=C awk '$1 == "#" && $2 == "bellhop" && $3 == "layout" && $5 ~ /^[0-9]+$/ { print $5 }')
+    now=$(bh_now)
+    if [ -n "$epoch" ] && [ "$now" -ge "$epoch" ] 2>/dev/null; then
+      saved="layout saved $(ago $((now - epoch))) ago"
+    else
+      saved="layout file present"
+    fi
+  fi
+  if [ -d "$dir" ]; then
+    res ok "state: $(t "$dir") writable · $saved"
+  else
+    res ok "state: $(t "$dir") writable (the first save creates it) · $saved"
+  fi
+}
+
+check_map() {
+  local file rows err n=0 later='' line d s dir running=''
+  file=$(bh_map_path)
+  if [ ! -f "$file" ]; then
+    res ok "map: none (running sessions are numbered 1-9, then 0)"
+    return 0
+  fi
+  err=$(bh_map_rows --warn 2>&1 >/dev/null || true)
+  rows=$(bh_map_rows 2>/dev/null || true)
+  if [ -z "$CI" ] && [ -n "$SERVER" ]; then
+    running=$'\n'$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)$'\n'
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    res warn "map: ${line%; line skipped} (line skipped)" "bellhop map edit"
+  done <<<"$err"
+  while IFS=$'\t' read -r d s dir _; do
+    [ -n "$d" ] || continue
+    n=$((n + 1))
+    [ ! -d "$dir" ] || continue
+    case $running in
+      *$'\n'"$s"$'\n'*)
+        res warn "map: slot $d ($s) is running, but its folder $(t "$dir") is gone" "bellhop map set $d <folder>"
+        ;;
+      *) later="$later · $s (will start in ~)" ;;
+    esac
+  done <<<"$rows"
+  res ok "map: $(plural "$n" slot) in $(t "$file")$later"
+}
+
+# ── Claude Code ──────────────────────────────────────────────────────────────
+HOOKTSV=''
+check_hook() {
+  local ctl sh='' file='' method='' invalid='' kind a b c d ev=0 inst=0 miss=0 stale=0 dup='' approx=''
+  local stale_list='' miss_list=''
+  ctl=$ROOT/libexec/bellhop-hookctl
+  if [ ! -f "$ctl" ]; then
+    res warn "Claude Code hook: can't check (libexec/bellhop-hookctl is missing)" "reinstall the plugin"
+    return 0
+  fi
+  [ -x "$ctl" ] || sh=${BASH:-bash}
+  HOOKTSV=$(${sh:+"$sh"} "$ctl" status --tsv 2>/dev/null || true)
+  while IFS=$'\t' read -r kind a b c d _; do
+    case $kind in
+      file) file=$a method=$c ;;
+      invalid) invalid=$a ;;
+      event)
+        ev=$((ev + 1))
+        case $b in
+          installed)
+            inst=$((inst + 1))
+            [ "$a" = "*" ] || [ "${c:-0}" -le 1 ] || dup="$dup${dup:+, }$a"
+            ;;
+          stale)
+            stale=$((stale + 1))
+            stale_list="$stale_list${stale_list:+, }$a ($(t "$d"))"
+            ;;
+          *)
+            miss=$((miss + 1))
+            miss_list="$miss_list${miss_list:+, }$a"
+            ;;
+        esac
+        ;;
+    esac
+  done <<<"$HOOKTSV"
+  [ "$method" != grep ] || approx=" (checked without jq: approximate)"
+  if [ -n "$invalid" ]; then
+    res warn "Claude Code hook: can't read $(t "$file"): $invalid" "fix the JSON in $(t "$file"), then: bellhop hook install"
+  elif [ "$ev" -eq 0 ]; then
+    res warn "Claude Code hook: can't check" "bellhop hook status"
+  elif [ "$inst" -eq "$ev" ]; then
+    if [ -n "$dup" ]; then
+      res warn "Claude Code hook: installed, but more than once for $dup (it runs twice)" \
+        "bellhop hook uninstall && bellhop hook install"
+    else
+      res ok "Claude Code hook: installed for 5 events in $(t "$file")$approx"
+    fi
+  elif [ "$inst" -eq 0 ] && [ "$stale" -eq 0 ]; then
+    res warn "Claude Code hook: not installed (optional)$approx" "bellhop hook install"
+  else
+    [ -z "$miss_list" ] || res warn "Claude Code hook: missing for $miss_list$approx" "bellhop hook install"
+    [ -z "$stale_list" ] || res warn "Claude Code hook: stale path (not executable) for $stale_list" "bellhop hook install"
+  fi
+}
+
+check_managed() {
+  local file='' flags='' kind a
+  while IFS=$'\t' read -r kind a _; do
+    case $kind in
+      file) file=$a ;;
+      flag) flags="$flags${flags:+, }$a" ;;
+    esac
+  done <<<"$HOOKTSV"
+  if [ -n "$flags" ]; then
+    res warn "Claude Code settings: $flags is true in $(t "$file"), so Claude Code runs no hooks from it" \
+      "remove it from $(t "$file") (or ask whoever manages your Claude Code settings)"
+  else
+    res ok "Claude Code settings: hooks allowed (no disableAllHooks or allowManagedHooksOnly)"
+  fi
+}
+
+check_focus() {
+  local cmd from p
+  if [ -n "${BELLHOP_FOCUS_CMD+set}" ]; then
+    cmd=$BELLHOP_FOCUS_CMD from=BELLHOP_FOCUS_CMD
+  else
+    cmd=$(bh_opt focus-cmd) from=@bellhop-focus-cmd
+  fi
+  if [ -z "$cmd" ]; then
+    res ok "focus adapter: none (jump switches your client)"
+    return 0
+  fi
+  case $cmd in \~/*) cmd=$HOME/${cmd#\~/} ;; esac
+  case $cmd in
+    */*) p=$cmd ;;
+    *) p=$(type -P "$cmd" 2>/dev/null || true) ;;
+  esac
+  if [ -n "$p" ] && [ -x "$p" ] && [ ! -d "$p" ]; then
+    res ok "focus adapter: $(t "$p") ($from)"
+  else
+    res warn "focus adapter: $(t "$cmd") ($from) is not an executable file, so jump switches your client" \
+      "chmod +x $(t "$cmd"), or unset it: tmux set -gu @bellhop-focus-cmd"
+  fi
+}
+
+check_path() {
+  local p real mine
+  p=$(type -P bellhop 2>/dev/null || true)
+  if [ -z "$p" ]; then
+    res ok "command: bellhop is not on PATH (optional: $(t "$ROOT")/bin/bellhop link)"
+    return 0
+  fi
+  real=$(bh_realpath "$p" 2>/dev/null || echo "$p")
+  mine=$(bh_realpath "$ROOT/bin/bellhop" 2>/dev/null || echo "$ROOT/bin/bellhop")
+  if [ "$real" = "$mine" ]; then
+    res ok "command: $(t "$p") is this bellhop"
+  elif [ -f "$(dirname -- "$real")/../lib/bellhop/common.sh" ]; then
+    res warn "command: $(t "$p") is another copy of tmux-bellhop ($(t "$real"))" \
+      "remove it, or run: $(t "$ROOT")/bin/bellhop link"
+  else
+    res warn "command: $(t "$p") is some other program called bellhop (an acoustics toolbox ships one too)" \
+      "put this one first: $(t "$ROOT")/bin/bellhop link --dir <a folder early on PATH>, or call $(t "$ROOT")/bin/bellhop"
+  fi
+}
+
+skip_ci() { res skip "$1 (--ci)"; }
+
+# ── run ──────────────────────────────────────────────────────────────────────
+check_bellhop
+check_tmux
+check_fzf
+check_bash
+check_jq
+check_awk
+check_lock
+check_locale
+if [ -n "$CI" ]; then
+  for c in "inside tmux" "plugin and keys" "monitor-bell" "save hooks"; do skip_ci "$c"; done
+elif [ -n "${TMUX_BIN:-}" ]; then
+  check_inside
+  if [ -n "$SERVER" ]; then
+    check_plugin
+    check_keys
+    check_bell
+    check_save_hooks
+  else
+    for c in "plugin and keys" "monitor-bell" "save hooks"; do res skip "$c: no tmux server running"; done
+  fi
+else
+  for c in "inside tmux" "plugin and keys" "monitor-bell" "save hooks"; do res skip "$c: no tmux"; done
+fi
+check_state
+check_map
+if [ -n "$CI" ]; then
+  for c in "Claude Code hook" "Claude Code settings" "focus adapter" "command on PATH"; do skip_ci "$c"; done
+else
+  check_hook
+  check_managed
+  check_focus
+  check_path
+fi
+
+if [ "$FAILS" -gt 0 ]; then
+  echo
+  echo "$(plural "$FAILS" check) failed."
+  exit 1
+fi
+exit 0

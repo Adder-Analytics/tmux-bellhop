@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# bellhop link / unlink / uninstall: the few things bellhop puts outside its
+# own folder, and how they come back off.
+#
+#   bellhop link [--dir DIR]     symlink DIR/bellhop (default ~/.local/bin) to
+#                                bin/bellhop; never over a file that isn't ours
+#   bellhop unlink [--dir DIR]   remove that symlink, only when it points here
+#   bellhop uninstall [--purge]  hook entries out of Claude Code's settings,
+#                                the link off PATH, the keys and save hooks off
+#                                the running tmux server; --purge also deletes
+#                                the map and the saved layouts
+#
+# No shell rc file and no tmux.conf is ever edited: when a line needs to change
+# there, the exact line is printed.
+set -euo pipefail
+
+_self=$0
+_n=0
+while [ -L "$_self" ] && [ "$_n" -lt 40 ]; do
+  _l=$(readlink "$_self")
+  case $_l in
+    /*) _self=$_l ;;
+    *) _self=$(dirname "$_self")/$_l ;;
+  esac
+  _n=$((_n + 1))
+done
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$_self")/.." && pwd -P)
+# shellcheck source=../lib/bellhop/common.sh
+. "$ROOT/lib/bellhop/common.sh"
+
+BIN=$ROOT/bin/bellhop
+
+usage() {
+  cat <<'EOF'
+usage: bellhop link [--dir DIR]
+       bellhop unlink [--dir DIR]
+       bellhop uninstall [--purge]
+
+  link        put `bellhop` on PATH: a symlink DIR/bellhop (default ~/.local/bin)
+              to this plugin's bin/bellhop. Never replaces a file that isn't
+              that link. When DIR is not on PATH, prints the line for your
+              shell's startup file (it edits no file itself).
+  unlink      remove that symlink, only when it points to this plugin
+  uninstall   1. remove the Claude Code hook entries (bellhop hook uninstall)
+              2. remove the link (every bellhop symlink on PATH that points here)
+              3. take bellhop's keys and save hooks off the running tmux server
+                 (and off any other server of yours that loaded this copy),
+                 giving the keys back what they did before
+              4. print the tmux.conf line to delete
+              --purge also deletes ~/.config/bellhop and ~/.local/state/bellhop
+EOF
+}
+
+SUB=${1:-}
+[ $# -eq 0 ] || shift
+BH_CMD=$SUB
+
+DIR=''
+PURGE=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    --dir)
+      [ "$SUB" != uninstall ] && [ $# -ge 2 ] && [ -n "$2" ] || { usage >&2; exit 2; }
+      DIR=$2
+      shift
+      ;;
+    --dir=?*)
+      [ "$SUB" != uninstall ] || { usage >&2; exit 2; }
+      DIR=${1#--dir=}
+      ;;
+    --purge)
+      [ "$SUB" = uninstall ] || { usage >&2; exit 2; }
+      PURGE=1
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      warn "unknown option \`$1\`"
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+# ~/x → $HOME/x; a relative DIR is taken from here.
+expand() {
+  case $1 in
+    \~) printf '%s\n' "$HOME" ;;
+    \~/*) printf '%s\n' "$HOME/${1#\~/}" ;;
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s\n' "$PWD/$1" ;;
+  esac
+}
+
+MINE=$(bh_realpath "$BIN")
+
+# True when PATH_ is a symlink that ends at this plugin's bin/bellhop.
+ours() {
+  [ -L "$1" ] || return 1
+  [ "$(bh_realpath "$1" 2>/dev/null || true)" = "$MINE" ]
+}
+
+# True when DIR is on PATH (compared as written and as resolved).
+on_path() {
+  local d=$1 r p rp
+  r=$(bh_realpath "$d" 2>/dev/null || echo "$d")
+  local IFS=:
+  for p in $PATH; do
+    [ -n "$p" ] || continue
+    [ "$p" != "$d" ] || return 0
+    rp=$(bh_realpath "$p" 2>/dev/null || echo "$p")
+    [ "$rp" != "$r" ] || return 0
+  done
+  return 1
+}
+
+do_link() {
+  local dir link shown rc line
+  dir=$(expand "${DIR:-$HOME/.local/bin}")
+  link=$dir/bellhop
+  shown=$(tildify "$link")
+  if ours "$link"; then
+    echo "$shown already points to $(tildify "$BIN")"
+  else
+    if [ -L "$link" ]; then
+      die "$shown is a symlink to $(tildify "$(readlink "$link")"), not to this plugin; left alone (remove it first to link this one)"
+    elif [ -e "$link" ]; then
+      die "$shown already exists and is not bellhop's link; left alone"
+    fi
+    mkdir -p -- "$dir" || die "could not make $(tildify "$dir")"
+    ln -s -- "$BIN" "$link" || die "could not make $shown"
+    echo "linked $shown → $(tildify "$BIN")"
+  fi
+  if ! on_path "$dir"; then
+    case $dir in
+      "$HOME") line='export PATH="$HOME:$PATH"' ;;
+      "$HOME"/*) line="export PATH=\"\$HOME/${dir#"$HOME"/}:\$PATH\"" ;;
+      *) line="export PATH=\"$dir:\$PATH\"" ;;
+    esac
+    case ${SHELL:-} in
+      */zsh) rc=\~/.zshrc ;;
+      */bash) rc=\~/.bashrc ;;
+      */fish)
+        rc=\~/.config/fish/config.fish
+        line="fish_add_path $(tildify "$dir")"
+        ;;
+      *) rc="your shell's startup file" ;;
+    esac
+    echo
+    echo "$(tildify "$dir") is not on your PATH. Add this line to $rc, then open a new shell:"
+    echo "  $line"
+  fi
+  return 0
+}
+
+do_unlink() {
+  local dir link shown
+  dir=$(expand "${DIR:-$HOME/.local/bin}")
+  link=$dir/bellhop
+  shown=$(tildify "$link")
+  if ours "$link"; then
+    rm -f -- "$link"
+    echo "removed $shown"
+  elif [ -L "$link" ] || [ -e "$link" ]; then
+    warn "$shown is not a link to this plugin; left alone"
+    return 1
+  else
+    echo "no link at $shown"
+  fi
+}
+
+# Every bellhop symlink that points here: the default one and any on PATH.
+our_links() {
+  local p seen=
+  local IFS=:
+  for p in "$HOME/.local/bin" $PATH; do
+    [ -n "$p" ] || continue
+    case ":$seen:" in *":$p:"*) continue ;; esac
+    seen=$seen:$p
+    if ours "$p/bellhop"; then printf '%s\n' "$p/bellhop"; fi
+  done
+}
+
+# The lines of tmux.conf that load bellhop, as file:line: text.
+conf_lines() {
+  local f
+  for f in "$HOME/.tmux.conf" "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"; do
+    [ -f "$f" ] || continue
+    LC_ALL=C awk -v f="$(tildify "$f")" '/tmux-bellhop|bellhop\.tmux/ { print "  " f ":" FNR ": " $0 }' "$f"
+  done
+}
+
+# unload_from: run bellhop.tmux unload against the server tmux finds from the
+# environment (the caller sets TMUX to aim it at another socket).
+unload_from() {
+  if [ -x "$ROOT/bellhop.tmux" ]; then
+    "$ROOT/bellhop.tmux" unload || true
+  else
+    "${BASH:-bash}" "$ROOT/bellhop.tmux" unload || true
+  fi
+}
+
+# other_servers: the other tmux servers of this user (sockets beside this
+# one in tmux's socket folder) that loaded bellhop, as "socket<TAB>root".
+other_servers() {
+  local here dir sock r
+  if [ -n "${TMUX:-}" ]; then here=${TMUX%%,*}; else here=''; fi
+  [ -n "$here" ] || here=$(tmux display-message -p '#{socket_path}' 2>/dev/null || true)
+  dir=${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)
+  [ -d "$dir" ] || return 0
+  for sock in "$dir"/*; do
+    [ -S "$sock" ] || continue
+    [ "$sock" != "$here" ] || continue
+    [ -z "$here" ] || ! [ "$sock" -ef "$here" ] || continue
+    r=$(command "$TMUX_BIN" -S "$sock" show-options -gqv @bellhop-root 2>/dev/null || true)
+    [ -z "$r" ] || printf '%s\t%s\n' "$sock" "$r"
+  done
+}
+
+do_uninstall() {
+  local rc=0 ctl sh='' out links l sroot state conf lines sock r name
+  echo "1. Claude Code hook"
+  ctl=$ROOT/libexec/bellhop-hookctl
+  [ -x "$ctl" ] || sh=${BASH:-bash}
+  out=$(${sh:+"$sh"} "$ctl" uninstall 2>&1 </dev/null) || rc=1
+  printf '%s\n' "$out" | LC_ALL=C awk '{ print "   " $0 }'
+
+  echo "2. the bellhop command"
+  links=$(our_links)
+  if [ -z "$links" ]; then
+    echo "   no bellhop link to this plugin on PATH"
+  else
+    while IFS= read -r l; do
+      [ -n "$l" ] || continue
+      rm -f -- "$l" && echo "   removed $(tildify "$l")"
+    done <<<"$links"
+  fi
+
+  echo "3. the running tmux server ($(bh_socket_name))"
+  if [ -n "${TMUX_BIN:-}" ] && tmux list-sessions >/dev/null 2>&1; then
+    sroot=$(bh_opt @bellhop-root)
+    if [ -z "$sroot" ]; then
+      echo "   bellhop is not loaded on this server; nothing to take off"
+    else
+      if [ "$sroot" != "$ROOT" ]; then
+        echo "   note: this server loaded bellhop from $(tildify "$sroot"); taking off what $(tildify "$ROOT") bound"
+      fi
+      unload_from
+      if [ -z "$(bh_opt @bellhop-root)" ]; then
+        echo "   keys and save hooks removed; the keys do what they did before bellhop"
+      else
+        echo "   could not unload; run: $(tildify "$ROOT")/bellhop.tmux unload"
+        rc=1
+      fi
+    fi
+  else
+    echo "   no tmux server running; nothing to take off"
+  fi
+  # Other servers (tmux -L NAME) that loaded this copy: their keys would call
+  # a deleted folder once the clone is gone. Another copy's are left alone.
+  if [ -n "${TMUX_BIN:-}" ]; then
+    while IFS=$'\t' read -r sock r; do
+      [ -n "$sock" ] || continue
+      name=$(basename -- "$sock")
+      if [ "$r" = "$ROOT" ]; then
+        TMUX="$sock,0,0" TMUX_PANE='' unload_from
+        if [ -z "$(command "$TMUX_BIN" -S "$sock" show-options -gqv @bellhop-root 2>/dev/null || true)" ]; then
+          echo "   also took bellhop off the server $name (tmux -L $name)"
+        else
+          echo "   could not unload the server $name; run: tmux -L $name run-shell '$(tildify "$ROOT")/bellhop.tmux unload'"
+          rc=1
+        fi
+      else
+        echo "   left the server $name alone: it loaded bellhop from $(tildify "$r")"
+      fi
+    done < <(other_servers)
+  fi
+
+  echo "4. tmux.conf (not edited by bellhop)"
+  lines=$(conf_lines || true)
+  if [ -n "$lines" ]; then
+    echo "   delete these lines:"
+    printf '%s\n' "$lines" | LC_ALL=C awk '{ print "  " $0 }'
+  else
+    echo "   delete the line that loads bellhop (set -g @plugin '…/tmux-bellhop' or run-shell …/bellhop.tmux)"
+  fi
+  echo "   then press prefix alt-u (TPM), or: rm -rf $(tildify "$ROOT")"
+
+  conf=${XDG_CONFIG_HOME:-$HOME/.config}/bellhop
+  state=$(bh_state_root)
+  if [ -n "$PURGE" ]; then
+    echo "5. the map and saved layouts"
+    for l in "$conf" "$state"; do
+      case $l in
+        */bellhop)
+          if [ -e "$l" ]; then
+            rm -rf -- "$l" && echo "   removed $(tildify "$l")"
+          else
+            echo "   no $(tildify "$l")"
+          fi
+          ;;
+        *) echo "   left $(tildify "$l") (not a bellhop folder); remove it by hand if you want" ;;
+      esac
+    done
+  else
+    echo "5. the map and saved layouts are kept; to delete them:"
+    echo "   rm -rf $(tildify "$state") $(tildify "$conf")    # or, before the plugin folder goes: $(tildify "$BIN") uninstall --purge"
+  fi
+  return "$rc"
+}
+
+case $SUB in
+  link) do_link ;;
+  unlink) do_unlink ;;
+  uninstall) do_uninstall ;;
+  -h | --help | help) usage ;;
+  '')
+    usage >&2
+    exit 2
+    ;;
+  *)
+    warn "unknown subcommand \`$SUB\`"
+    usage >&2
+    exit 2
+    ;;
+esac

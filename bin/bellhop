@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# bellhop: the one command. Git style: `bellhop <cmd>` runs libexec/bellhop-<file>;
+# version, help, panes and jump are answered here from lib/bellhop/common.sh.
+set -euo pipefail
+
+# The plugin folder, through any symlink (`bellhop link` puts one on PATH).
+# compat.sh's bh_realpath lives under the folder we are looking for, so this
+# resolves by hand: a readlink loop, then cd -P.
+_self=$0
+_n=0
+while [ -L "$_self" ] && [ "$_n" -lt 40 ]; do
+  _l=$(readlink "$_self")
+  case $_l in
+    /*) _self=$_l ;;
+    *) _self=$(dirname "$_self")/$_l ;;
+  esac
+  _n=$((_n + 1))
+done
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$_self")/.." && pwd -P)
+export BELLHOP_ROOT="$ROOT" # a hint for child scripts; they resolve their own root
+BH_CMD=
+# shellcheck source=../lib/bellhop/common.sh
+. "$ROOT/lib/bellhop/common.sh"
+
+usage() {
+  cat <<'EOF'
+usage: bellhop <command> [args]
+
+popups (bound to prefix i, prefix / and prefix m)
+  inbox               every Claude Code pane, the one waiting on you first
+  find                any tab in any session, by name or conversation title
+  move                move marked tabs to a numbered session
+
+after a reboot
+  restore [--dry-run] [--yes] [-L SOCKET]   bring saved sessions and tabs back
+  save [-L SOCKET]                          snapshot the layout (hooks do this)
+
+setup
+  map [-L SOCKET] [list|init|set|...]       the numbered-session map
+  hook [install|uninstall|status]           the optional Claude Code hook
+  doctor [--ci] [-L SOCKET]                 check the install
+  link [--dir DIR] | unlink                 put `bellhop` on PATH, or take it off
+  uninstall [--purge]                       remove hook, link, keys and hooks
+
+plumbing
+  panes                                     every pane, 16 tab-separated columns
+  jump <window-id> [pane-id] [client]       go to a tab wherever it is
+  version | help [command]
+EOF
+}
+
+# The script for a command, and the argument it needs in front.
+target() {
+  case $1 in
+    inbox | find | move | map | doctor) T=bellhop-$1 A= ;;
+    save | restore) T=bellhop-layout A=$1 ;;
+    hook) T=bellhop-hookctl A= ;;
+    link | unlink | uninstall) T=bellhop-setup A=$1 ;;
+    *) return 1 ;;
+  esac
+}
+
+run() {
+  local cmd=$1
+  shift
+  target "$cmd" || return 1
+  local f=$ROOT/libexec/$T
+  if [ ! -f "$f" ]; then
+    printf 'bellhop: `%s` is not available in this install (missing libexec/%s)\n' "$cmd" "$T" >&2
+    exit 2
+  fi
+  # Not executable (a checkout that lost its modes): run it with this bash.
+  local sh=
+  [ -x "$f" ] || sh=${BASH:-bash}
+  if [ -n "$A" ]; then
+    exec ${sh:+"$sh"} "$f" "$A" "$@"
+  fi
+  exec ${sh:+"$sh"} "$f" "$@"
+}
+
+cmd=${1:-}
+[ $# -eq 0 ] || shift
+
+case $cmd in
+  version | --version | -V)
+    cat "$ROOT/VERSION"
+    ;;
+  help | -h | --help)
+    topic=${1:-}
+    case $topic in
+      '') usage ;;
+      panes)
+        echo "usage: bellhop panes"
+        echo "One line per pane on the server, tab-separated:"
+        echo "  slot session session_id window_id window_index window_name bell pane_id"
+        echo "  active command path title state since claude_session note"
+        echo "state: needs-you, finished, working, idle or none."
+        ;;
+      jump)
+        echo "usage: bellhop jump <window-id> [pane-id] [client]"
+        echo "Selects the tab (and pane), then focuses a terminal already showing its"
+        echo "session through @bellhop-focus-cmd, or switches the client there."
+        ;;
+      version) echo "usage: bellhop version" ;;
+      help) echo "usage: bellhop help [command]" ;;
+      *)
+        target "$topic" || {
+          usage >&2
+          exit 2
+        }
+        run "$topic" --help
+        ;;
+    esac
+    ;;
+  panes)
+    case ${1:-} in
+      -h | --help)
+        exec "$0" help panes
+        ;;
+      '') bh_panes ;;
+      --autorename) bh_panes --autorename ;;
+      *)
+        usage >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  jump)
+    case ${1:-} in
+      -h | --help) exec "$0" help jump ;;
+      '')
+        echo "usage: bellhop jump <window-id> [pane-id] [client]" >&2
+        exit 2
+        ;;
+    esac
+    BH_CMD=jump
+    bh_jump "$1" "${2:-}" "${3:-}"
+    ;;
+  '')
+    usage >&2
+    exit 2
+    ;;
+  *)
+    if ! target "$cmd"; then
+      printf 'bellhop: unknown command `%s`\n' "$cmd" >&2
+      usage >&2
+      exit 2
+    fi
+    run "$cmd" "$@"
+    ;;
+esac
