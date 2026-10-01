@@ -1,0 +1,284 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FZF_VERSION: 0.55.0
+  TERM: xterm-256color
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends shellcheck
+          shellcheck --version | sed -n 2p
+
+      # shellcheck -x --severity=warning and bash -n on bellhop.tmux, bin/*,
+      # lib/bellhop/*.sh, libexec/*, contrib/focus/*, demo/*.sh, demo/bin/*,
+      # scripts/*.sh and tests/run.sh; lint-portability; Python syntax of
+      # tests/*.py. The same target runs locally, so the two never drift.
+      - name: make lint
+        run: make lint
+
+      - name: Docs check
+        run: make docs-check
+
+      - name: Privacy (public rules)
+        run: scripts/scrub-check.sh --public
+
+  privacy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # exiftool lets the check read image metadata (EXIF, XMP, PNG text chunks).
+      - name: Install exiftool
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends libimage-exiftool-perl
+          exiftool -ver
+
+      - name: scrub-check --public
+        run: scripts/scrub-check.sh --public
+
+  test:
+    name: test (${{ matrix.leg }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: linux-mawk
+            os: ubuntu-24.04
+          - leg: linux-gawk
+            os: ubuntu-24.04
+          - leg: macos-bash5
+            os: macos-15
+          - leg: macos-bash32
+            os: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # ── install deps ──────────────────────────────────────────────────────
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends tmux jq gawk mawk python3
+          # Installing gawk makes it the system awk; the default awk here is mawk.
+          sudo update-alternatives --set awk "$(command -v mawk)"
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install tmux jq bash
+          # Homebrew bash first on PATH (the bash 3.2 leg puts its shim before it).
+          echo "$(brew --prefix)/bin" >>"$GITHUB_PATH"
+
+      - name: Install fzf ${{ env.FZF_VERSION }} (release binary)
+        run: |
+          case $RUNNER_OS-$RUNNER_ARCH in
+            Linux-X64) asset=linux_amd64 sum=4df2393776942780ddab2cea713ddaac06cd5c3886cd23bc9119a6d3aa1e02bd ;;
+            Linux-ARM64) asset=linux_arm64 sum=7affbfb35ed2da650da7b62a9590eb9bc2fb083cfe055c9f4c794b0bbfeaefcc ;;
+            macOS-ARM64) asset=darwin_arm64 sum=d9e796f54b485196572dbe5f72a3771296c8e74952df19800a8d7d596921794d ;;
+            macOS-X64) asset=darwin_amd64 sum=b5ba0cae4b6c7b8a572121933c2307fac5affbeec3e219ad93757250aae859a4 ;;
+            *) echo "::error::no pinned fzf for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+          esac
+          tgz=$RUNNER_TEMP/fzf-$FZF_VERSION-$asset.tar.gz
+          curl -fsSL --retry 3 -o "$tgz" \
+            "https://github.com/junegunn/fzf/releases/download/v$FZF_VERSION/fzf-$FZF_VERSION-$asset.tar.gz"
+          echo "$sum  $tgz" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/fzf-bin"
+          tar -xzf "$tgz" -C "$RUNNER_TEMP/fzf-bin"
+          echo "$RUNNER_TEMP/fzf-bin" >>"$GITHUB_PATH"
+
+      - name: Shim dir (awk -> gawk)
+        if: matrix.leg == 'linux-gawk'
+        run: |
+          mkdir -p "$RUNNER_TEMP/shim"
+          ln -s "$(command -v gawk)" "$RUNNER_TEMP/shim/awk"
+          echo "$RUNNER_TEMP/shim" >>"$GITHUB_PATH"
+
+      - name: Shim dir (bash -> /bin/bash)
+        if: matrix.leg == 'macos-bash32'
+        run: |
+          mkdir -p "$RUNNER_TEMP/shim"
+          ln -s /bin/bash "$RUNNER_TEMP/shim/bash"
+          echo "$RUNNER_TEMP/shim" >>"$GITHUB_PATH"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # ── versions: printed, and the leg's premise checked ──────────────────
+      - name: Versions
+        env:
+          LEG: ${{ matrix.leg }}
+        run: |
+          tmux -V
+          fzf --version
+          bash --version | sed -n 1p
+          if [ "$RUNNER_OS" = Linux ]; then awk -W version 2>&1 </dev/null | sed -n 1p
+          else awk --version 2>&1 </dev/null | sed -n 1p; fi
+          jq --version
+          python3 --version
+
+          fail() { echo "::error::$LEG: $*"; exit 1; }
+          fzf --version | grep -q "^${FZF_VERSION}[ (]" || fail "fzf is not $FZF_VERSION"
+          case $LEG in
+            linux-mawk) awk -W version 2>&1 </dev/null | sed -n 1p | grep -qi mawk || fail "awk is not mawk" ;;
+            linux-gawk) awk --version 2>&1 </dev/null | sed -n 1p | grep -q 'GNU Awk' || fail "awk is not gawk" ;;
+            macos-bash5) bash -c '[ "${BASH_VERSINFO[0]}" -ge 5 ]' || fail "bash on PATH is not bash 5" ;;
+            macos-bash32) bash --version | sed -n 1p | grep -q 'version 3\.2\.57' || fail "bash on PATH is not 3.2.57" ;;
+          esac
+
+      - name: Test environment
+        run: |
+          {
+            echo "TMUX_TMPDIR=$(mktemp -d /tmp/bh.XXXX)"
+            echo "HOME=$(mktemp -d)"
+            if [ "$RUNNER_OS" = Linux ]; then echo "LANG=C.UTF-8"; fi
+            if [ "$RUNNER_OS" = macOS ]; then echo "BELLHOP_TEST_TIMEOUT_SCALE=2"; fi
+          } >>"$GITHUB_ENV"
+
+      - name: bash -n with /bin/bash (3.2)
+        if: matrix.leg == 'macos-bash32'
+        run: |
+          n=0
+          for f in bellhop.tmux bin/* lib/bellhop/*.sh libexec/* contrib/focus/* \
+                   demo/*.sh demo/bin/* scripts/*.sh tests/run.sh; do
+            [ -f "$f" ] || continue
+            /bin/bash -n "$f"
+            n=$((n + 1))
+          done
+          echo "bash -n (/bin/bash $(/bin/bash -c 'echo $BASH_VERSION')): $n files ok"
+
+      - name: bellhop doctor --ci
+        env:
+          LEG: ${{ matrix.leg }}
+        run: |
+          unset TMUX
+          rc=0
+          out=$(bin/bellhop doctor --ci 2>&1) || rc=$?
+          printf '%s\n' "$out"
+          [ "$rc" -eq 0 ] || { echo "::error::bellhop doctor --ci exited $rc"; exit 1; }
+          if [ "$LEG" = macos-bash32 ]; then
+            printf '%s\n' "$out" | grep -Eq '^ok +bash 3\.2\.57([ (]|$)' ||
+              { echo "::error::doctor --ci does not report bash 3.2.57"; exit 1; }
+          fi
+
+      - name: tests/run.sh
+        run: |
+          unset TMUX
+          tests/run.sh
+
+      - name: Upload test artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-artifacts-${{ matrix.leg }}
+          path: tests/.artifacts/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
+  demos-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      LANG: C.UTF-8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install deps (as linux-mawk)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends tmux jq gawk mawk python3
+          sudo update-alternatives --set awk "$(command -v mawk)"
+
+      - name: Install fzf ${{ env.FZF_VERSION }} (release binary)
+        run: |
+          tgz=$RUNNER_TEMP/fzf-$FZF_VERSION-linux_amd64.tar.gz
+          curl -fsSL --retry 3 -o "$tgz" \
+            "https://github.com/junegunn/fzf/releases/download/v$FZF_VERSION/fzf-$FZF_VERSION-linux_amd64.tar.gz"
+          echo "4df2393776942780ddab2cea713ddaac06cd5c3886cd23bc9119a6d3aa1e02bd  $tgz" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/fzf-bin"
+          tar -xzf "$tgz" -C "$RUNNER_TEMP/fzf-bin"
+          echo "$RUNNER_TEMP/fzf-bin" >>"$GITHUB_PATH"
+
+      # The demo world's inbox rows and every query a tape types, checked
+      # without rendering: demo/expected-inbox.tsv and demo/expected-queries.tsv.
+      - name: Demo world matches the README
+        run: |
+          unset TMUX TMUX_PANE
+          DEMO_RING_NOW=1 demo/setup.sh
+          # shellcheck disable=SC1091
+          . "${TMPDIR:-/tmp}/bellhop-demo.env"
+          sleep 1
+          T() { tmux -L bellhop-demo "$@"; }
+          TMUX="$(T display-message -p '#{socket_path}'),$(T display-message -p '#{pid}'),0"
+          export TMUX
+
+          got=$(mktemp "${RUNNER_TEMP}/inbox.XXXXXX")
+          bellhop inbox --rows | cut -f3,4,5,7,8 >"$got"
+          echo "inbox --rows (state slot session title detail):"
+          cat "$got"
+          diff -u demo/expected-inbox.tsv "$got"
+
+          # find's rows as seen from the find tape's start tab (docs:2).
+          read -r sid wid <<<"$(T display-message -p -t '=docs:2' '#{session_id} #{window_id}')"
+          bad=0
+          while read -r tool query want; do
+            case $tool in '' | '#'*) continue ;; esac
+            case $tool in
+              inbox) rows=$(bellhop inbox --rows --shown) ;;
+              find) rows=$(bellhop find --rows --shown "$sid" "$wid") ;;
+              *) echo "::error::expected-queries.tsv: unknown tool '$tool'"; bad=1; continue ;;
+            esac
+            n=$(printf '%s\n' "$rows" |
+              env -u FZF_DEFAULT_OPTS -u FZF_DEFAULT_OPTS_FILE fzf --filter "$query" | wc -l | tr -d ' ')
+            if [ "$n" = "$want" ]; then
+              echo "ok    $tool '$query': $n"
+            else
+              echo "::error::$tool '$query' matches $n rows, expected $want"
+              printf '%s\n' "$rows" | env -u FZF_DEFAULT_OPTS -u FZF_DEFAULT_OPTS_FILE fzf --filter "$query" | sed 's/^/        /'
+              bad=1
+            fi
+          done <demo/expected-queries.tsv
+          exit "$bad"
+
+      - name: Teardown
+        if: always()
+        run: |
+          if [ -x demo/teardown.sh ] || [ -f demo/teardown.sh ]; then bash demo/teardown.sh || true; fi

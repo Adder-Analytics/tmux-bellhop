@@ -1,0 +1,132 @@
+name: Demos
+
+# Renders docs/img from demo/tapes against the fictional demo server
+# (tmux -L bellhop-demo under a temp HOME) and uploads the images as an
+# artifact. It never commits: a human downloads them, runs `make scrub`,
+# looks at every frame (gifsicle --explode) and commits them.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: demos-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  VHS_VERSION: 0.12.1
+  VHS_SHA256: 30a9b2746f19522387eace24f427208b5dc4ce2413d334147a0b89a2304cfbe4
+  TTYD_VERSION: 1.7.7
+  TTYD_SHA256: 8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55
+  FZF_VERSION: 0.55.0
+  FZF_SHA256: 4df2393776942780ddab2cea713ddaac06cd5c3886cd23bc9119a6d3aa1e02bd
+  LANG: C.UTF-8
+  TERM: xterm-256color
+  # Ubuntu 24.04 blocks the headless browser's sandbox (no unprivileged user
+  # namespaces); vhs renders without it.
+  VHS_NO_SANDBOX: "true"
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # apt packages come from the Ubuntu 24.04 archive and are checked
+      # against the upstream series below; vhs, ttyd and fzf are exact
+      # releases checked by sha256.
+      - name: Install apt packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            ffmpeg fonts-dejavu-core fontconfig gifsicle libimage-exiftool-perl \
+            tmux jq gawk mawk rsync
+          sudo update-alternatives --set awk "$(command -v mawk)"
+          bad=0
+          while read -r pkg want; do
+            have=$(dpkg-query -W -f='${Version}' "$pkg")
+            case $have in
+              $want*) echo "ok    $pkg $have" ;;
+              *) echo "::error::$pkg is $have, expected $want*"; bad=1 ;;
+            esac
+          done <<'EOF'
+          ffmpeg 7:6.1
+          fonts-dejavu-core 2.37
+          gifsicle 1.9
+          EOF
+          exit "$bad"
+
+      - name: Install vhs ${{ env.VHS_VERSION }}, ttyd ${{ env.TTYD_VERSION }}, fzf ${{ env.FZF_VERSION }}
+        run: |
+          bin=$RUNNER_TEMP/demo-bin
+          mkdir -p "$bin"
+
+          deb=$RUNNER_TEMP/vhs_${VHS_VERSION}_amd64.deb
+          curl -fsSL --retry 3 -o "$deb" \
+            "https://github.com/charmbracelet/vhs/releases/download/v$VHS_VERSION/vhs_${VHS_VERSION}_amd64.deb"
+          echo "$VHS_SHA256  $deb" | shasum -a 256 -c -
+          sudo dpkg -i "$deb"
+
+          curl -fsSL --retry 3 -o "$bin/ttyd" \
+            "https://github.com/tsl0922/ttyd/releases/download/$TTYD_VERSION/ttyd.x86_64"
+          echo "$TTYD_SHA256  $bin/ttyd" | shasum -a 256 -c -
+          chmod +x "$bin/ttyd"
+
+          tgz=$RUNNER_TEMP/fzf-$FZF_VERSION-linux_amd64.tar.gz
+          curl -fsSL --retry 3 -o "$tgz" \
+            "https://github.com/junegunn/fzf/releases/download/v$FZF_VERSION/fzf-$FZF_VERSION-linux_amd64.tar.gz"
+          echo "$FZF_SHA256  $tgz" | shasum -a 256 -c -
+          tar -xzf "$tgz" -C "$bin"
+
+          echo "$bin" >>"$GITHUB_PATH"
+
+      - name: Versions
+        run: |
+          {
+            vhs --version
+            echo "ttyd $(ttyd --version 2>&1 | sed -n 1p)"
+            ffmpeg -version | sed -n 1p
+            echo "gifsicle $(gifsicle --version | sed -n 1p)"
+            echo "fonts-dejavu-core $(dpkg-query -W -f='${Version}' fonts-dejavu-core)"
+            tmux -V
+            echo "fzf $(fzf --version)"
+            bash --version | sed -n 1p
+          }
+          fc-list ':charset=2733 25d0' family | sort -u
+
+      # make demos copies the tracked files to /tmp/tmux-bellhop (the only
+      # path render.sh accepts, so no frame shows the runner's checkout path),
+      # renders there, and copies docs/img back.
+      - name: Render (make demos)
+        run: |
+          unset TMUX TMUX_PANE
+          make demos
+
+      - name: Upload docs/img
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docs-img
+          path: docs/img/
+          if-no-files-found: error
+          retention-days: 14
+
+      # The public privacy rules over the new images too (--tree also scans
+      # files git does not track yet). A hit fails the run; the images are
+      # uploaded first so they can be inspected.
+      - name: scrub-check --public --tree
+        run: scripts/scrub-check.sh --public --tree
+
+      - name: Teardown
+        if: always()
+        run: |
+          if [ -f /tmp/tmux-bellhop/demo/teardown.sh ]; then bash /tmp/tmux-bellhop/demo/teardown.sh || true; fi
