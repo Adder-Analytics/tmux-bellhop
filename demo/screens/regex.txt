@@ -1,0 +1,12 @@
+> Explain this regex: ^v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.]+)?$
+
+● It matches a version number such as v2.10.3 or 1.0.0-rc.1:
+  ^v?          an optional v at the start
+  (\d+)\.      the major number, then a dot
+  (\d+)\.      the minor number, then a dot
+  (\d+)        the patch number
+  (-[0-9A-Za-z.]+)?   an optional pre-release tag, like -rc.1
+  $            nothing after it
+
+────────────────────────────────────────────────────────────────
+>

@@ -1,0 +1,22 @@
+# map: digit  session  folder
+map	1	api	~/src/api
+map	2	web	~/src/web
+map	3	docs	~/src/docs
+map	4	infra	~/src/infra
+map	5	mobile	~/src/mobile
+# tab: session  index  window-name  title  state  age_s  screen  id-suffix
+tab	api	1	Fix flaky checkout test	✳ Fix flaky checkout test	needs-you	60	permission-bash	01
+tab	api	2	Add rate limiting to /login	◐ Add rate limiting to /login	working	180	ratelimit	02
+tab	api	3	server	-	shell	-	server-log	-
+tab	web	1	Dark mode for the settings page	✳ Dark mode for the settings page	finished	240	darkmode-done	03
+tab	web	2	Upgrade to React 19	✳ Upgrade to React 19	idle	3600	react19	04
+tab	web	3	storybook	-	shell	-	-	-
+tab	docs	1	Write the v2 migration guide	✳ Write the v2 migration guide	finished	720	migration-done	05
+tab	docs	2	preview	-	shell	-	-	-
+tab	infra	1	Terraform plan for staging	◐ Terraform plan for staging	working	40	terraform	06
+tab	infra	2	Rotate staging TLS certificates	✳ Rotate staging TLS certificates	needs-you	360	permission-edit	07
+tab	infra	3	logs	-	shell	-	-	-
+tab	scratch	1	Explain this regex	✳ Explain this regex	idle	10800	regex	08
+# notes: needs-you messages
+note	api	1	Claude needs your permission to use Bash
+note	infra	2	Claude needs your permission to use Edit

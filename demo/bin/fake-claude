@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# fake-claude SCREEN: the demo's stand-in for a Claude Code session. It prints
+# demo/screens/SCREEN.txt and then waits, so the pane shows a fixed, fictional
+# screen. It runs nothing and talks to nothing. The pane's title and the
+# bellhop state are set by demo/setup.sh (through the real hook).
+# `fake-claude server-log` is the one exception: after the log it leaves an
+# ordinary shell prompt, so a tape can type a command there.
+set -u
+here=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd -P)
+screen=${1:-}
+case $screen in
+  '' | */* | .*)
+    echo "usage: fake-claude SCREEN   (a name from demo/screens)" >&2
+    exit 2
+    ;;
+esac
+f=$here/screens/$screen.txt
+[ -f "$f" ] || {
+  echo "fake-claude: no screen $screen" >&2
+  exit 2
+}
+cat "$f"
+if [ "$screen" = server-log ]; then
+  # PS1 is set here: a non-interactive bash (this script) drops it from the env.
+  exec env PS1='\W \$ ' "${SHELL:-bash}" --norc --noprofile -i
+fi
+printf '\033[?25l' # no cursor, as in a Claude Code screen waiting on you
+while :; do sleep 86400; done

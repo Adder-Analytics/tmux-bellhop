@@ -1,0 +1,11 @@
+> Terraform plan for staging
+
+● Bash(terraform plan -out staging.tfplan)
+    # aws_instance.web[0] will be updated in-place
+    ~ instance_type = "t3.small" -> "t3.medium"
+    # aws_security_group.lb will be updated in-place
+    + ingress { from_port = 443, to_port = 443 }
+
+  Plan: 0 to add, 2 to change, 0 to destroy.
+
+◐ Checking the plan against the staging budget…

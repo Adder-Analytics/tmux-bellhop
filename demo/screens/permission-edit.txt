@@ -1,0 +1,17 @@
+> The staging TLS certificates expire next week. Rotate them.
+
+● Read(infra/tls/staging.tf)
+● The certificate renews when fewer than 7 days remain. Raising the
+  window to 30 days makes the next plan issue a new certificate.
+
+╭──────────────────────────────────────────────────────────────╮
+│ Edit file                                                    │
+│                                                              │
+│   Edit(infra/tls/staging.tf)                                 │
+│   - min_days_remaining = 7                                   │
+│   + min_days_remaining = 30                                  │
+│                                                              │
+│ Do you want to proceed?                                      │
+│ ❯ 1. Yes                                                     │
+│   2. No                                                      │
+╰──────────────────────────────────────────────────────────────╯

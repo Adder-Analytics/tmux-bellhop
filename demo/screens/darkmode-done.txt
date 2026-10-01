@@ -1,0 +1,15 @@
+> Dark mode for the settings page
+
+● Update(src/settings/theme.css)
+  + @media (prefers-color-scheme: dark) {
+  +   :root { --bg: #1e1e2e; --fg: #cdd6f4; }
+  + }
+
+● Update(src/settings/SettingsPage.tsx)
+  + <ThemeToggle value={theme} onChange={setTheme} />
+
+● Done. The settings page follows the system theme, and the new
+  toggle overrides it. 3 files changed.
+
+────────────────────────────────────────────────────────────────
+>

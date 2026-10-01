@@ -1,0 +1,8 @@
+needs-you	1	api	Fix flaky checkout test	permission to use Bash
+needs-you	4	infra	Rotate staging TLS certificates	permission to use Edit
+finished	2	web	Dark mode for the settings page	rang 4m ago
+finished	3	docs	Write the v2 migration guide	rang 12m ago
+working	1	api	Add rate limiting to /login	3m
+working	4	infra	Terraform plan for staging	40s
+idle	2	web	Upgrade to React 19	1h
+idle		scratch	Explain this regex	3h

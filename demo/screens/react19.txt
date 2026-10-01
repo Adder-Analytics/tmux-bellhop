@@ -1,0 +1,14 @@
+> Upgrade to React 19
+
+● Update(package.json)
+  - "react": "18.3.1",
+  + "react": "19.0.0",
+
+● Two components still set defaultProps on a function component
+  (Avatar and Badge). The defaults now live in their parameters.
+
+● Bash(npm test)
+  ✓ 42 passed (3.1s)
+
+────────────────────────────────────────────────────────────────
+>

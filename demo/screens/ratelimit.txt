@@ -1,0 +1,14 @@
+> Add rate limiting to /login
+
+● Read(src/routes/login.ts)
+● A sliding window per IP address: 5 attempts a minute, then 429
+  with a Retry-After header.
+
+● Write(src/middleware/rateLimit.ts)
+  + export const loginLimiter = rateLimit({ windowMs: 60_000, max: 5 });
+
+● Update(src/routes/login.ts)
+  - router.post('/login', login);
+  + router.post('/login', loginLimiter, login);
+
+◐ Writing the tests…

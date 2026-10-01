@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The demo's `claude`: only on the demo PATH, so `bellhop restore` finds a
+# claude to type `claude --resume <id>` for. It starts nothing.
+echo "(demo) claude $*"

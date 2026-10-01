@@ -1,0 +1,19 @@
+> The checkout test fails about one run in five. Find out why and fix it.
+
+● The test waits a fixed 200 ms for the cart total. On a slow run the
+  total arrives later, so the assertion reads the old value.
+
+● Update(tests/checkout.spec.ts)
+  - await page.waitForTimeout(200);
+  + await expect(page.getByTestId('cart-total')).toHaveText('$42.00');
+
+╭──────────────────────────────────────────────────────────────╮
+│ Bash command                                                 │
+│                                                              │
+│   Bash(npm test -- checkout.spec.ts)                         │
+│   Run the checkout tests                                     │
+│                                                              │
+│ Do you want to proceed?                                      │
+│ ❯ 1. Yes                                                     │
+│   2. No                                                      │
+╰──────────────────────────────────────────────────────────────╯
