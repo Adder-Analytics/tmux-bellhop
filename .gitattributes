@@ -1,0 +1,5 @@
+* text=auto eol=lf
+docs/img/* binary
+*.png binary
+*.gif binary
+*.jpg binary
