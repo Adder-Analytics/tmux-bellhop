@@ -34,7 +34,7 @@ BH_CMD="inbox"
 # checkout that lost its modes is run through bash, as the dispatcher does.
 SELF=("$0")
 [ -x "$0" ] || SELF=("${BASH:-bash}" "$0")
-TAB=$'\t'
+TAB=$'\t' US=$'\x1f'
 
 usage() {
   cat <<'EOF'
@@ -238,7 +238,8 @@ case ${1:-} in
     if [ $# -eq 3 ] || [ $# -eq 4 ]; then
       ctx=("$1" "$2" "$3" "${4:-}")
     elif [ $# -eq 0 ]; then
-      # \x1f, not tab: read collapses whitespace, so an empty client name
+      # Tabs from tmux (the one control byte every tmux client prints as is),
+      # 0x1F for read: read collapses whitespace, so an empty client name
       # would shift the session id into its place. With nobody attached here,
       # tmux names some other session's client; don't pop up on their screen.
       # (Asked first, read after: an IFS set for read would also split the
@@ -246,8 +247,8 @@ case ${1:-} in
       tgt=()
       [ -z "${TMUX_PANE:-}" ] || tgt=(-t "$TMUX_PANE")
       info=$(tmux display-message -p ${tgt[@]+"${tgt[@]}"} \
-        $'#{client_name}\x1f#{session_id}\x1f#{window_id}\x1f#{pane_id}\x1f#{==:#{client_session},#{session_name}}')
-      IFS=$'\x1f' read -r -a ctx <<<"$info"
+        $'#{client_name}\t#{session_id}\t#{window_id}\t#{pane_id}\t#{==:#{client_session},#{session_name}}')
+      IFS=$US read -r -a ctx <<<"${info//$TAB/$US}"
       if [ -z "${ctx[0]:-}" ] || [ "${ctx[4]:-}" != 1 ]; then
         die "no client is attached to this session"
       fi

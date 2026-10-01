@@ -161,15 +161,16 @@ case ${1:-} in
     if [ $# -eq 3 ]; then
       ctx=("$@")
     elif [ $# -eq 0 ]; then
-      # \x1f, not tab: read collapses whitespace, so an empty client name
+      # Tabs from tmux (the one control byte every tmux client prints as is),
+      # 0x1F for read: read collapses whitespace, so an empty client name
       # would shift the session id into its place. With nobody attached here,
       # tmux names some other session's client; don't pop up on their screen.
       # (Asked first, read after: under bash 3.2 an IFS set for read also
       # splits the words of a command inside a process substitution on its
       # line, so tmux would get "-t %0" as one word.)
       info=$(tmux display-message -p ${HERE[@]+"${HERE[@]}"} \
-        $'#{client_name}\x1f#{session_id}\x1f#{window_id}\x1f#{==:#{client_session},#{session_name}}')
-      IFS=$'\x1f' read -r -a ctx <<<"$info"
+        $'#{client_name}\t#{session_id}\t#{window_id}\t#{==:#{client_session},#{session_name}}')
+      IFS=$'\x1f' read -r -a ctx < <(printf '%s\n' "$info" | tr '\t' '\037')
       if [ -z "${ctx[0]:-}" ] || [ "${ctx[3]:-}" != 1 ]; then
         die "no client is attached to this session"
       fi

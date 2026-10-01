@@ -98,6 +98,9 @@ bh_map_path() {
 # With a map file: its valid lines in digit order, pinned=1 (a bad line is
 # skipped; --warn says why on stderr). Without one: the running sessions in
 # list-sessions order numbered 1-9 then 0, pinned=0.
+# (--warn is passed from libexec/bellhop-map and bellhop-doctor, which an
+# older shellcheck checking this file alone cannot see.)
+# shellcheck disable=SC2120
 bh_map_rows() {
   local warn='' f
   [ "${1:-}" != --warn ] || warn=1
@@ -122,8 +125,8 @@ bh_map_rows() {
         print d, s, rest, 1
       }' "$f" | LC_ALL=C sort -t "$(printf '\t')" -k1,1n
   else
-    tmux list-sessions -F $'#{session_name}\x1f#{session_path}' 2>/dev/null |
-      LC_ALL=C awk -F $'\x1f' -v OFS='\t' 'NR <= 10 { print (NR == 10 ? 0 : NR), $1, $2, 0 }'
+    tmux list-sessions -F $'#{s/\t/ /:session_name}\t#{s/\t/ /:session_path}' 2>/dev/null |
+      LC_ALL=C awk -F '\t' -v OFS='\t' 'NR <= 10 { print (NR == 10 ? 0 : NR), $1, $2, 0 }'
   fi
   return 0
 }
@@ -154,17 +157,19 @@ bh_slot_session() {
 bh_panes() {
   local fmt ar=''
   [ "${1:-}" != --autorename ] || ar=1
-  # Fields come from tmux split by 0x1F, so a tab inside a title or a note
-  # can't shift the columns; it becomes a space on the way out.
-  fmt=$'#{session_name}\x1f#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_name}\x1f#{window_bell_flag}\x1f#{pane_id}\x1f#{pane_active}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{pane_title}\x1f#{@bellhop_state}\x1f#{@bellhop_since}\x1f#{@bellhop_session}\x1f#{@bellhop_note}'
-  [ -z "$ar" ] || fmt=$fmt$'\x1f#{automatic-rename}'
+  # Fields come from tmux tab-separated, and tmux itself turns a tab inside a
+  # title, note, name or path into a space (the s/ modifier) before printing,
+  # so the columns can't shift. Tab is the one separator every tmux passes
+  # through: from 3.4 the client spells any other control byte in command
+  # output out as \ooo.
+  fmt=$'#{s/\t/ /:session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{s/\t/ /:window_name}\t#{window_bell_flag}\t#{pane_id}\t#{pane_active}\t#{s/\t/ /:pane_current_command}\t#{s/\t/ /:pane_current_path}\t#{s/\t/ /:pane_title}\t#{@bellhop_state}\t#{@bellhop_since}\t#{@bellhop_session}\t#{s/\t/ /:@bellhop_note}'
+  [ -z "$ar" ] || fmt=$fmt$'\t#{automatic-rename}'
   # Spinners are an alternation, never a bracket: in byte mode a bracket of
   # multibyte characters is a set of bytes that holds 0xE2, the lead byte of ✳.
   tmux list-panes -a -F "$fmt" 2>/dev/null |
-    LC_ALL=C awk -F $'\x1f' -v OFS='\t' -v ar="$ar" '
+    LC_ALL=C awk -F '\t' -v OFS='\t' -v ar="$ar" '
       FILENAME == ARGV[1] { if (split($0, s, "\t") >= 2) slot[s[2]] = s[1]; next }
       {
-        for (i = 1; i <= NF; i++) gsub(/\t/, " ", $i)
         c = "none"
         if ($11 ~ /◐|◓|◑|◒/) c = "working"
         else if ($12 == "needs-you") c = "needs-you"
@@ -190,8 +195,8 @@ bh_panes() {
 bh_jump() {
   local win=${1:-} pane=${2:-} client=${3:-} info sid sess focus caller others slot
   [ -n "$win" ] || { warn "jump: which window?"; return 2; }
-  info=$(tmux display-message -p -t "$win" $'#{session_id}\x1f#{session_name}') || return 1
-  sid=${info%%$'\x1f'*} sess=${info#*$'\x1f'}
+  info=$(tmux display-message -p -t "$win" $'#{session_id}\t#{s/\t/ /:session_name}') || return 1
+  sid=${info%%$'\t'*} sess=${info#*$'\t'}
   tmux select-window -t "$win"
   [ -z "$pane" ] || tmux select-pane -t "$pane"
   if [ -n "${BELLHOP_FOCUS_CMD+set}" ]; then

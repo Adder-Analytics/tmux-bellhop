@@ -122,8 +122,8 @@ write_map() {
 
 # "running<TAB>N" per running session, from one tmux call (nothing without a server).
 running_sessions() {
-  tmux list-sessions -F $'#{session_name}\x1f#{session_windows}' 2>/dev/null |
-    LC_ALL=C awk -F $'\x1f' -v OFS='\t' '{ print $1, $2 }' || true
+  tmux list-sessions -F $'#{s/\t/ /:session_name}\t#{session_windows}' 2>/dev/null |
+    LC_ALL=C awk -F '\t' -v OFS='\t' '{ print $1, $2 }' || true
 }
 
 cmd_list() {
@@ -202,7 +202,7 @@ cmd_init() {
     die "$(tildify "$MAP") already exists; bellhop map init --force replaces it"
   fi
   lines=
-  while IFS=$'\x1f' read -r name path; do
+  while IFS=$'\t' read -r name path; do
     [ -n "$name" ] || continue
     if ! valid_session "$name" 2>/dev/null; then
       skipped="$skipped${skipped:+, }$name"
@@ -212,7 +212,7 @@ cmd_init() {
     n=$((n + 1))
     [ -n "$path" ] || path=$HOME
     lines="$lines$((n % 10))  $name  $(tildify "$path")"$'\n'
-  done < <(tmux list-sessions -F $'#{session_name}\x1f#{session_path}' 2>/dev/null || true)
+  done < <(tmux list-sessions -F $'#{s/\t/ /:session_name}\t#{s/\t/ /:session_path}' 2>/dev/null || true)
   [ "$n" -gt 0 ] || die "no sessions running on the tmux server $SERVER to number; start some, or use bellhop map set <digit> [dir]"
   { template; echo; printf '%s' "$lines"; } | write_map
   echo "wrote $(tildify "$MAP") with $(plural "$n" slot), from the sessions on the tmux server $SERVER:"

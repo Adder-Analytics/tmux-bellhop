@@ -303,7 +303,8 @@ restore_main() {
   local name path cs end ar cmd have_claude='' missing='' skipped='' late='' made=0 tabs=0 typed=0
   local ans i win firsttab skip_cur='' started=0 tabs_made=0 noprompt=''
   local cl note maprows
-  local -a sessions rows nm plan
+  # (=(): under set -u, bash 5.2 counts a declared but empty array as unbound.)
+  local -a sessions=() rows=() nm=() plan=()
   while [ $# -gt 0 ]; do
     case $1 in
       --dry-run) dry=1 ;;

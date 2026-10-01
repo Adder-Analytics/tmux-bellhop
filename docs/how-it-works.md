@@ -92,7 +92,7 @@ The popup runs with the tmux server's environment, not your shell's. So each scr
 | 15 | claude_session | `@bellhop_session` |
 | 16 | note | `@bellhop_note` |
 
-tmux prints the fields separated by the byte 0x1F, and a tab inside a title or note becomes a space, so the columns can't shift. `bellhop jump <window-id> [pane-id] [client]` is the other piece of plumbing: it selects the tab and pane, then runs the [focus adapter](configuration.md#focus-adapters) or switches the client. Both are stable within a minor version.
+tmux prints the fields tab-separated, and turns a tab inside a title, note, name or path into a space itself (the `s/` format modifier) before printing, so the columns can't shift. Tab is the one separator every tmux passes through: from 3.4 the client spells any other control byte in command output out as `\ooo`. `bellhop jump <window-id> [pane-id] [client]` is the other piece of plumbing: it selects the tab and pane, then runs the [focus adapter](configuration.md#focus-adapters) or switches the client. Both are stable within a minor version.
 
 ## The layout file (v1)
 

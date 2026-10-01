@@ -43,8 +43,11 @@ MINE="'$BINF' "
 HOOKS="after-new-window window-unlinked session-closed"
 HOOK_CMD="run-shell -b \"[ -x '$BINF' ] && '$BINF' save --from-hook || true\""
 # Tabs with a Claude title (✳, a spinner or braille, then a space) are named
-# after it, glyph stripped; every other tab keeps tmux's default name.
-TITLE_FMT='#{?#{m/r:^(✳|◐|◓|◑|◒|[⠀-⣿]) ,#{pane_title}},#{s/^[^ ]+ //:pane_title},#{?pane_in_mode,[tmux],#{pane_current_command}}#{?pane_dead,[dead],}}' # portable-ok: a tmux regex, not awk
+# after it, glyph stripped; every other tab keeps tmux's default name. The
+# glyph is "one character outside printable ASCII": a bracket range of
+# multibyte characters never matches under glibc's regex, so the range here
+# has ASCII ends.
+TITLE_FMT='#{?#{m/r:^[^ -~] ,#{pane_title}},#{s/^[^ ]+ //:pane_title},#{?pane_in_mode,[tmux],#{pane_current_command}}#{?pane_dead,[dead],}}' # portable-ok: a tmux regex, not awk
 
 opt() { tmux show-options -gqv "$1" 2>/dev/null || true; }
 opt_set() { [ -n "$(tmux show-options -gq "$1" 2>/dev/null || true)" ]; }
