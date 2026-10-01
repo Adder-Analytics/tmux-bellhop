@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# bellhop-hook: the Claude Code hook (SessionStart, UserPromptSubmit,
+# Notification, Stop, SessionEnd). It keeps the Claude's state in its tmux
+# pane's options (@bellhop_*), where `bellhop panes` reads it for the inbox,
+# find and restore, and rings the pane's bell when Claude finishes or needs
+# you, so tmux flags the tab.
+#
+# It runs on every prompt, so it is small: one jq call (when jq exists), one
+# tmux call and one printf. It never prints (stdout on SessionStart and
+# UserPromptSubmit goes into Claude's context) and always exits 0 (exit 2
+# would block a prompt or keep Claude running). No set -e on purpose.
+exec >/dev/null 2>&1
+
+# The plugin folder, through any symlink: compat.sh is below it.
+_root() {
+  local s=$0 l n=0
+  while [ -L "$s" ] && [ "$n" -lt 40 ]; do
+    l=$(readlink "$s") || break
+    case $l in
+      /*) s=$l ;;
+      *) s=$(dirname "$s")/$l ;;
+    esac
+    n=$((n + 1))
+  done
+  CDPATH='' cd -P -- "$(dirname -- "$s")/.." && pwd -P
+}
+
+# The value of "key": "..." in a JSON object, without jq: the first match,
+# with \" and \\ un-escaped. Good enough for the flat objects Claude Code sends.
+_field() {
+  local re="\"$1\"[[:space:]]*:[[:space:]]*\"(([^\"\\\\]|\\\\.)*)\"" v
+  [[ $2 =~ $re ]] || return 0
+  v=${BASH_REMATCH[1]}
+  v=${v//\\\\/$'\001'}
+  v=${v//\\\"/\"}
+  v=${v//$'\001'/\\}
+  printf '%s' "$v"
+}
+
+main() {
+  local root input jq event='' session='' ntype='' message='' now P out tty autosave needs=''
+  local -a a
+  [ -n "${TMUX_PANE:-}" ] || return 0
+  root=$(_root) || return 0
+  # shellcheck source=../lib/bellhop/compat.sh
+  . "$root/lib/bellhop/compat.sh" || return 0
+  [ -n "${TMUX_BIN:-}" ] || return 0
+
+  input=$(cat)
+  jq=${BELLHOP_JQ:-jq}
+  case $jq in */*) ;; *) jq=$(type -P "$jq" 2>/dev/null || true) ;; esac
+  if [ -n "$jq" ] && [ -x "$jq" ]; then
+    # One line, fields split by 0x1F, control characters as spaces.
+    IFS=$'\037' read -r event session ntype message < <(printf '%s' "$input" | "$jq" -r '
+      [.hook_event_name, .session_id, .notification_type, .message]
+      | map(if . == null then "" else tostring end | gsub("[[:cntrl:]]"; " "))
+      | join("\u001f")' 2>/dev/null)
+  else
+    event=$(_field hook_event_name "$input")
+    session=$(_field session_id "$input")
+    ntype=$(_field notification_type "$input")
+    message=$(_field message "$input")
+  fi
+
+  case $event in
+    SessionStart | UserPromptSubmit | Notification | Stop | SessionEnd) ;;
+    *) return 0 ;;
+  esac
+
+  # One line, capped at 200 characters: `bellhop panes` reads it as one field.
+  message=${message//[[:cntrl:]]/ }
+  message=${message:0:200}
+  # tmux reads a trailing ';' as the end of the command; '\;' is a literal one.
+  case $message in *';') message="${message%;}\\;" ;; esac
+  case $session in *';') session="${session%;}\\;" ;; esac
+  now=$(bh_now)
+  P=$TMUX_PANE
+  a=()
+  [ -z "$session" ] || a+=(set-option -p -t "$P" @bellhop_session "$session" ';')
+  case $event in
+    SessionStart)
+      a+=(set-option -p -t "$P" @bellhop_state idle ';' set-option -p -t "$P" @bellhop_since "$now" ';'
+        set-option -p -u -t "$P" @bellhop_note ';')
+      ;;
+    UserPromptSubmit)
+      a+=(set-option -p -t "$P" @bellhop_state working ';' set-option -p -t "$P" @bellhop_since "$now" ';'
+        set-option -p -u -t "$P" @bellhop_note ';')
+      ;;
+    Stop)
+      a+=(set-option -p -t "$P" @bellhop_state finished ';' set-option -p -t "$P" @bellhop_since "$now" ';'
+        set-option -p -t "$P" @bellhop_rang "$now" ';')
+      ;;
+    Notification)
+      # "needs your permission to …" wants you now; "waiting for your input"
+      # leaves the state as it was. The type decides when Claude Code sends one.
+      if [ -n "$ntype" ]; then
+        [ "$ntype" != permission_prompt ] || needs=1
+      else
+        case $message in *ermission* | *pprov*) needs=1 ;; esac
+      fi
+      a+=(set-option -p -t "$P" @bellhop_note "$message" ';' set-option -p -t "$P" @bellhop_rang "$now" ';')
+      [ -z "$needs" ] || a+=(set-option -p -t "$P" @bellhop_state needs-you ';'
+        set-option -p -t "$P" @bellhop_since "$now" ';')
+      ;;
+    SessionEnd)
+      a+=(set-option -p -u -t "$P" @bellhop_state ';' set-option -p -u -t "$P" @bellhop_since ';'
+        set-option -p -u -t "$P" @bellhop_session ';' set-option -p -u -t "$P" @bellhop_note ';')
+      ;;
+  esac
+  a+=(display-message -p -t "$P" $'#{pane_tty}\037#{@bellhop-autosave}')
+  out=$("$TMUX_BIN" "${a[@]}" 2>/dev/null) || return 0
+  tty=${out%%$'\037'*}
+  autosave=${out#*$'\037'}
+
+  # The bell: tmux sets the window's bell flag, which is what "finished" means.
+  case $event in
+    Stop | Notification) [ -z "$tty" ] || printf '\a' >"$tty" ;;
+  esac
+
+  # Snapshot the layout for `bellhop restore`, detached: hooks block Claude.
+  case $event in
+    SessionStart | SessionEnd)
+      if [ "$autosave" != off ] && [ -x "$root/bin/bellhop" ]; then
+        nohup "$root/bin/bellhop" save --from-hook </dev/null >/dev/null 2>&1 &
+      fi
+      ;;
+  esac
+  return 0
+}
+
+main "$@" || true
+exit 0

@@ -1,0 +1,562 @@
+#!/usr/bin/env bash
+# bellhop hook: add, remove or check the Claude Code hook (bin/bellhop-hook) in
+# Claude Code's user settings file. Five events, one matcher group each:
+#
+#   {"hooks":[{"type":"command","command":"test -x '<root>/bin/bellhop-hook' && '<root>/bin/bellhop-hook' || true","timeout":5}]}
+#
+# The marker for "ours" is the substring bellhop-hook. Foreign hooks, keys and
+# key order are never touched (jq keeps order). Every write shows a diff first,
+# keeps a timestamped backup (the newest 3), writes a temp file in the same
+# folder and renames it over the original, but only after checking the file
+# still holds the bytes we read (Claude Code rewrites it too).
+#
+#   bellhop hook install [--yes] [--dry-run] [--settings PATH]
+#   bellhop hook uninstall [--dry-run] [--settings PATH]
+#   bellhop hook status [--quiet] [--settings PATH]
+#
+# The file: --settings, else $BELLHOP_CLAUDE_SETTINGS, else
+# $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json. Project
+# .claude/settings.json files are never touched. install and uninstall need jq;
+# status works without it (approximately).
+set -euo pipefail
+
+_self=$0
+_n=0
+while [ -L "$_self" ] && [ "$_n" -lt 40 ]; do
+  _l=$(readlink "$_self")
+  case $_l in
+    /*) _self=$_l ;;
+    *) _self=$(dirname "$_self")/$_l ;;
+  esac
+  _n=$((_n + 1))
+done
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$_self")/.." && pwd -P)
+# shellcheck source=../lib/bellhop/common.sh
+. "$ROOT/lib/bellhop/common.sh"
+BH_CMD=hook
+
+EVENTS="SessionStart UserPromptSubmit Notification Stop SessionEnd"
+EV='["SessionStart","UserPromptSubmit","Notification","Stop","SessionEnd"]'
+HOOK=$ROOT/bin/bellhop-hook
+CMD="test -x '$HOOK' && '$HOOK' || true"
+
+# jq helpers shared by every program below.
+JQ_DEFS='
+def ours: type == "object" and (.command | type) == "string" and (.command | contains("bellhop-hook"));
+def groups: if type == "array" then .[] | select(type == "object" and (.hooks | type) == "array") else empty end;
+def has_ours: any(groups; any(.hooks[]; ours));
+def event($e): if (.hooks | type) == "object" then .hooks[$e] else null end;
+'
+
+usage() {
+  cat <<'EOF'
+usage: bellhop hook install [--yes] [--dry-run] [--settings PATH]
+       bellhop hook uninstall [--dry-run] [--settings PATH]
+       bellhop hook status [--quiet] [--settings PATH]
+
+The optional Claude Code hook: it tells bellhop when a Claude is working,
+finished or waiting for your permission, and rings the tab's bell.
+
+  install     add bellhop-hook to SessionStart, UserPromptSubmit, Notification,
+              Stop and SessionEnd. Shows the change and asks first.
+  uninstall   remove every hook whose command runs bellhop-hook
+  status      each event: installed, missing or stale (the path is gone)
+
+  --yes            install without asking
+  --dry-run        show the change, write nothing
+  --settings PATH  another settings file
+  --quiet          status: print nothing; exit 0 only when all five are installed
+
+The file: $BELLHOP_CLAUDE_SETTINGS, else $CLAUDE_CONFIG_DIR/settings.json,
+else ~/.claude/settings.json. Each write keeps a backup beside it,
+settings.json.bellhop-backup-<UTC time> (the newest 3). Needs jq, except status.
+EOF
+}
+
+# ── arguments ────────────────────────────────────────────────────────────────
+SUB=${1:-status}
+[ $# -eq 0 ] || shift
+YES='' DRY='' QUIET='' TSV='' OPT_SETTINGS=''
+case $SUB in
+  install | uninstall | status) ;;
+  -h | --help | help)
+    usage
+    exit 0
+    ;;
+  *)
+    warn "unknown subcommand \`$SUB\`"
+    usage >&2
+    exit 2
+    ;;
+esac
+bad_flag() {
+  warn "$SUB: unknown option \`$1\`"
+  usage >&2
+  exit 2
+}
+while [ $# -gt 0 ]; do
+  case $1 in
+    -y | --yes) [ "$SUB" != status ] || bad_flag "$1"; YES=1 ;;
+    -n | --dry-run) [ "$SUB" != status ] || bad_flag "$1"; DRY=1 ;;
+    -q | --quiet) [ "$SUB" = status ] || bad_flag "$1"; QUIET=1 ;;
+    --tsv) [ "$SUB" = status ] || bad_flag "$1"; TSV=1 ;; # internal: for doctor
+    --settings)
+      [ $# -ge 2 ] && [ -n "$2" ] || bad_flag "$1"
+      OPT_SETTINGS=$2
+      shift
+      ;;
+    --settings=?*) OPT_SETTINGS=${1#--settings=} ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *) bad_flag "$1" ;;
+  esac
+  shift
+done
+
+# ── the settings file ────────────────────────────────────────────────────────
+if [ -n "$OPT_SETTINGS" ]; then
+  SETTINGS=$OPT_SETTINGS
+elif [ -n "${BELLHOP_CLAUDE_SETTINGS:-}" ]; then
+  SETTINGS=$BELLHOP_CLAUDE_SETTINGS
+elif [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  SETTINGS=$CLAUDE_CONFIG_DIR/settings.json
+else
+  SETTINGS=$HOME/.claude/settings.json
+fi
+case $SETTINGS in
+  \~) SETTINGS=$HOME ;;
+  \~/*) SETTINGS=$HOME/${SETTINGS#\~/} ;;
+  /*) ;;
+  *) SETTINGS=$PWD/$SETTINGS ;;
+esac
+SHOWN=$(tildify "$SETTINGS")
+BASE=$(basename -- "$SETTINGS")
+# Backups sit beside the path you know; a symlinked file is written through
+# to its target, so the link stays a link.
+BAKDIR=$(dirname -- "$SETTINGS")
+resolve() { REAL=$(bh_realpath "$SETTINGS" 2>/dev/null) || REAL=$SETTINGS; }
+resolve
+
+JQ=${BELLHOP_JQ:-jq}
+case $JQ in */*) ;; *) JQ=$(type -P "$JQ" 2>/dev/null || true) ;; esac
+have_jq() { [ -n "$JQ" ] && [ -x "$JQ" ]; }
+need_jq() {
+  have_jq && return 0
+  warn "$SUB needs jq, which was not found (macOS: brew install jq · Debian/Ubuntu: sudo apt install jq)"
+  exit 1
+}
+
+WORK=
+cleanup() { [ -z "$WORK" ] || rm -rf -- "$WORK"; }
+trap cleanup EXIT
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/bellhop-hook.XXXXXX")
+SNAP=$WORK/read          # the bytes we read, compared again before the rename
+IN=$WORK/in.json         # the same, or {} for a missing file
+A=$WORK/before.json      # jq-normalised before
+B=$WORK/after.json       # the new content
+
+# Read the file once (steps 1-2): a missing file is {}; anything but one JSON
+# object is refused, with jq's words, and nothing is ever written.
+EXISTS=0
+read_settings() {
+  local err
+  resolve
+  if [ -d "$REAL" ]; then die "$SHOWN is a folder, not a settings file"; fi
+  # A link whose target's folder is missing: writing would replace the link.
+  if [ -L "$SETTINGS" ] && [ "$REAL" = "$SETTINGS" ]; then
+    die "$SHOWN is a link that points to a missing folder ($(readlink -- "$SETTINGS")); create that folder or fix the link"
+  fi
+  if [ -e "$REAL" ]; then
+    cp -- "$REAL" "$SNAP" || die "could not read $SHOWN"
+    cp -- "$SNAP" "$IN"
+    EXISTS=1
+  else
+    : >"$SNAP"
+    printf '{}\n' >"$IN"
+    EXISTS=0
+  fi
+  if ! err=$("$JQ" -e -s 'length == 1 and (.[0] | type) == "object"' "$IN" 2>&1 >/dev/null); then
+    [ -n "$err" ] || err="not one JSON object"
+    warn "$SHOWN is not a JSON object bellhop can edit; nothing written"
+    printf '  %s\n' "$err" >&2
+    exit 1
+  fi
+  "$JQ" . "$IN" >"$A"
+}
+
+show_diff() { # LABEL
+  diff -u "$A" "$B" | LC_ALL=C awk -v a="$SHOWN" -v b="$SHOWN ($1)" '
+    NR == 1 && /^--- / { print "--- " a; next }
+    NR == 2 && /^\+\+\+ / { print "+++ " b; next }
+    { print }' || true
+}
+
+confirm() { # QUESTION
+  local a=''
+  [ -z "$YES" ] || return 0
+  if [ -t 0 ]; then
+    printf '%s [y/N] ' "$1"
+    IFS= read -r a || true
+  else
+    # No terminal: an answer piped in still counts; none at all is the same
+    # refusal restore gives, naming --yes.
+    if ! IFS= read -r a && [ -z "$a" ]; then
+      warn "no terminal to ask on; nothing written (--yes writes without asking)"
+      exit 2
+    fi
+    printf '%s [y/N] %s\n' "$1" "$a"
+  fi
+  case $a in y | Y | yes | Yes | YES) return 0 ;; esac
+  return 1
+}
+
+prune() {
+  local f n=0
+  (
+    CDPATH='' cd -- "$BAKDIR" 2>/dev/null || exit 0
+    for f in "$BASE".bellhop-backup-*; do
+      [ -e "$f" ] && printf '%s\n' "$f"
+    done
+  ) | LC_ALL=C sort -r | while IFS= read -r f; do
+    n=$((n + 1))
+    [ "$n" -le 3 ] || rm -f -- "$BAKDIR/$f"
+  done
+}
+
+# Write $B over the file (step 5). Returns 3, having changed nothing, when the
+# file no longer holds the bytes read_settings saw.
+BACKUP=
+commit() {
+  local dir stamp bak='' tmp k=1 u
+  dir=$(dirname -- "$REAL")
+  mkdir -p -- "$dir" "$BAKDIR"
+  if [ "$EXISTS" = 1 ]; then
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    bak=$BAKDIR/$BASE.bellhop-backup-$stamp
+    while [ -e "$bak" ]; do
+      k=$((k + 1))
+      bak=$BAKDIR/$BASE.bellhop-backup-$stamp-$k
+    done
+    cp -p -- "$REAL" "$bak"
+  fi
+  tmp=$(mktemp "$dir/.$BASE.bellhop.XXXXXX")
+  if [ "$EXISTS" = 1 ]; then
+    cp -p -- "$REAL" "$tmp" # keeps the mode (and owner, where allowed)
+  else
+    u=$(umask)
+    chmod "$(printf '%o' $((0666 & ~0$u)))" "$tmp"
+  fi
+  cat -- "$B" >"$tmp"
+  if [ "$EXISTS" = 1 ]; then
+    if ! cmp -s -- "$REAL" "$SNAP" || { [ -n "$bak" ] && ! cmp -s -- "$bak" "$SNAP"; }; then
+      rm -f -- "$tmp" ${bak:+"$bak"}
+      return 3
+    fi
+  elif [ -e "$REAL" ]; then
+    rm -f -- "$tmp"
+    return 3
+  fi
+  if ! mv -f -- "$tmp" "$REAL"; then
+    rm -f -- "$tmp"
+    die "could not write $SHOWN"
+  fi
+  prune
+  BACKUP=${bak:+$(basename -- "$bak")}
+}
+
+# ── install ──────────────────────────────────────────────────────────────────
+do_install() {
+  local attempt=1 shape counts added updated q confirmed='' last=''
+  need_jq
+  case $HOOK in *"'"*) die "the plugin folder's path holds a ' ($(tildify "$ROOT")); move it and try again" ;; esac
+  [ -x "$HOOK" ] || die "$(tildify "$HOOK") is not executable; run: chmod +x '$HOOK'"
+  while :; do
+    read_settings
+    shape=$("$JQ" -r --argjson ev "$EV" "$JQ_DEFS"'
+      if .hooks != null and (.hooks | type) != "object" then "\"hooks\" is not an object"
+      else first(($ev[] as $e | select((event($e) // []) | type != "array") | "\"hooks.\($e)\" is not a list"), "")
+      end' "$IN")
+    [ -z "$shape" ] || die "$SHOWN: $shape; nothing written"
+    "$JQ" --argjson ev "$EV" --arg cmd "$CMD" "$JQ_DEFS"'
+      reduce $ev[] as $e (.;
+        if (event($e) | has_ours) then
+          .hooks[$e] |= map(if type == "object" and (.hooks | type) == "array"
+                            then .hooks |= map(if ours then .command = $cmd else . end)
+                            else . end)
+        else
+          .hooks[$e] = ((event($e) // []) + [{hooks: [{type: "command", command: $cmd, timeout: 5}]}])
+        end)' "$IN" >"$B"
+    if cmp -s -- "$A" "$B"; then
+      echo "Already installed ($SHOWN)."
+      return 0
+    fi
+    counts=$("$JQ" -n -r --argjson ev "$EV" --slurpfile a "$A" --slurpfile b "$B" "$JQ_DEFS"'
+      [$ev[] | . as $e | select(($a[0] | event($e) | has_ours) | not)] as $add
+      | [$ev[] | . as $e | select(($a[0] | event($e) | has_ours) and ($a[0] | event($e)) != ($b[0] | event($e)))] as $upd
+      | "\($add | length) \($upd | length)"')
+    added=${counts% *} updated=${counts#* }
+    if [ "$attempt" = 1 ] || ! cmp -s -- "$B" "$last"; then
+      show_diff "with bellhop"
+      if [ -n "$DRY" ]; then
+        echo "(dry run: nothing written)"
+        return 0
+      fi
+      if [ "$added" -gt 0 ]; then
+        q="Add bellhop's hook to $(plural "$added" event)"
+        [ "$updated" -eq 0 ] || q="$q and point $updated more at $(tildify "$HOOK")"
+      else
+        q="Point bellhop's hook at $(tildify "$HOOK") in $(plural "$updated" event)"
+      fi
+      confirm "$q?" || {
+        echo "Nothing written."
+        exit 1
+      }
+      confirmed=1
+    fi
+    [ -n "$confirmed" ] || exit 1
+    last=$WORK/confirmed.json
+    cp -- "$B" "$last"
+    if commit; then break; fi
+    [ "$attempt" = 1 ] || die "$BASE kept changing; nothing written"
+    attempt=2
+    echo "$SHOWN changed while bellhop was writing it (Claude Code rewrites it); reading it again."
+  done
+  if [ "$added" -gt 0 ] && [ "$updated" -gt 0 ]; then
+    q="Added $(plural "$added" hook) and updated $(plural "$updated" hook)"
+  elif [ "$added" -gt 0 ]; then
+    q="Added $(plural "$added" hook)"
+  else
+    q="Updated $(plural "$updated" hook) to $(tildify "$HOOK")"
+  fi
+  if [ -n "$BACKUP" ]; then q="$q (backup: $BACKUP)"; else q="$q (new file $SHOWN)"; fi
+  echo "$q. New Claude Code sessions pick this up; restart open ones."
+}
+
+# ── uninstall ────────────────────────────────────────────────────────────────
+do_uninstall() {
+  local attempt=1 n
+  need_jq
+  while :; do
+    resolve
+    if [ ! -e "$REAL" ]; then
+      echo "No bellhop hook to remove ($SHOWN does not exist)."
+      return 0
+    fi
+    read_settings
+    # Every hook object whose command holds bellhop-hook goes. A matcher group,
+    # an event key and "hooks" itself are dropped only when this emptied them.
+    "$JQ" "$JQ_DEFS"'
+      def strip: if type == "object" and (.hooks | type) == "array" and any(.hooks[]; ours)
+                 then (.hooks |= map(select(ours | not))) | select(.hooks | length > 0)
+                 else . end;
+      if (.hooks | type) == "object" then
+        (.hooks | length) as $had
+        | reduce (.hooks | keys_unsorted[]) as $e (.;
+            if (.hooks[$e] | has_ours) then
+              .hooks[$e] |= [.[] | strip]
+              | if (.hooks[$e] | length) == 0 then del(.hooks[$e]) else . end
+            else . end)
+        | if $had > 0 and (.hooks | length) == 0 then del(.hooks) else . end
+      else . end' "$IN" >"$B"
+    if cmp -s -- "$A" "$B"; then
+      echo "No bellhop hook in $SHOWN; nothing to remove."
+      return 0
+    fi
+    n=$("$JQ" -n -r --slurpfile a "$A" --slurpfile b "$B" "$JQ_DEFS"'
+      def count: [.. | objects | select(ours)] | length;
+      ($a[0] | count) - ($b[0] | count)')
+    if [ "$attempt" = 1 ]; then
+      show_diff "without bellhop"
+      if [ -n "$DRY" ]; then
+        echo "(dry run: nothing written)"
+        return 0
+      fi
+    fi
+    if commit; then break; fi
+    [ "$attempt" = 1 ] || die "$BASE kept changing; nothing written"
+    attempt=2
+    echo "$SHOWN changed while bellhop was writing it (Claude Code rewrites it); reading it again."
+  done
+  echo "Removed $(plural "$n" hook) (backup: $BACKUP)."
+}
+
+# ── status ───────────────────────────────────────────────────────────────────
+# The bellhop-hook path a command runs: the first '…bellhop-hook' in quotes,
+# else the word that holds bellhop-hook (~ expanded).
+hook_path() {
+  local c=$1 re="'([^']*bellhop-hook)'" w
+  if [[ $c =~ $re ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  set -f
+  # shellcheck disable=SC2086 # split the command into words on purpose
+  set -- $c
+  set +f
+  for w in "$@"; do
+    case $w in
+      *bellhop-hook*)
+        case $w in \~/*) w=$HOME/${w#\~/} ;; esac
+        printf '%s\n' "$w"
+        return 0
+        ;;
+    esac
+  done
+  printf '\n'
+}
+
+# ROWS: "event<TAB>state<TAB>count<TAB>path" per event (state installed,
+# missing or stale); with grep, one row for event "*". FLAGS: the settings
+# that stop Claude Code from running hooks. METHOD: jq or grep. INVALID: why
+# the file can't be read, if it can't.
+ROWS='' FLAGS='' METHOD='' INVALID=''
+collect() {
+  local e line n p state all kind ev c exe hits
+  resolve
+  if [ -e "$REAL" ] && [ ! -r "$REAL" ]; then
+    INVALID="not readable"
+  fi
+  if have_jq; then
+    METHOD="jq"
+    if [ -e "$REAL" ] && [ -z "$INVALID" ]; then
+      if ! INVALID=$("$JQ" -e -s 'length == 1 and (.[0] | type) == "object"' "$REAL" 2>&1 >/dev/null); then
+        [ -n "$INVALID" ] || INVALID="not one JSON object"
+      fi
+    fi
+    if [ -n "$INVALID" ]; then return 0; fi
+    # One jq call: "cmd<TAB>event<TAB>command" per entry of ours, "flag<TAB>name".
+    all=
+    if [ -e "$REAL" ]; then
+      all=$("$JQ" -r --argjson ev "$EV" "$JQ_DEFS"'
+        ($ev[] as $e | event($e) | groups | .hooks[] | select(ours)
+          | "cmd\t\($e)\t\(.command | gsub("[[:cntrl:]]"; " "))"),
+        (if .disableAllHooks == true then "flag\tdisableAllHooks" else empty end),
+        (if .allowManagedHooksOnly == true then "flag\tallowManagedHooksOnly" else empty end)' "$REAL")
+    fi
+    for e in $EVENTS; do
+      n=0 exe='' p=''
+      while IFS=$'\t' read -r kind ev c; do
+        [ "$kind" = cmd ] && [ "$ev" = "$e" ] || continue
+        n=$((n + 1))
+        c=$(hook_path "$c")
+        [ -n "$p" ] || p=$c
+        if [ -z "$exe" ] && [ -n "$c" ] && [ -x "$c" ] && [ ! -d "$c" ]; then exe=$c; fi
+      done <<<"$all"
+      if [ "$n" -eq 0 ]; then
+        state=missing
+      elif [ -n "$exe" ]; then
+        state=installed p=$exe
+      else
+        state=stale
+      fi
+      ROWS="$ROWS$e	$state	$n	$p"$'\n'
+    done
+    while IFS=$'\t' read -r kind ev _; do
+      [ "$kind" != flag ] || FLAGS="$FLAGS${FLAGS:+ }$ev"
+    done <<<"$all"
+  else
+    # Without jq: count the guarded entries whose quoted path is executable.
+    METHOD="grep"
+    n=0 p=''
+    if [ -e "$REAL" ] && [ -z "$INVALID" ]; then
+      hits=$(grep -o "test -x '[^']*bellhop-hook'" "$REAL" 2>/dev/null || true)
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        c=${line#test -x \'}
+        c=${c%\'}
+        if [ -x "$c" ] && [ ! -d "$c" ]; then
+          n=$((n + 1))
+          p=$c
+        fi
+      done <<<"$hits"
+      for e in disableAllHooks allowManagedHooksOnly; do
+        if grep -Eq "\"$e\"[[:space:]]*:[[:space:]]*true" "$REAL" 2>/dev/null; then
+          FLAGS="$FLAGS${FLAGS:+ }$e"
+        fi
+      done
+    fi
+    if [ "$n" -ge 5 ]; then state=installed; else state=missing; fi
+    ROWS="*	$state	$n	$p"$'\n'
+  fi
+}
+
+all_installed() {
+  [ -z "$INVALID" ] || return 1
+  [ -n "$ROWS" ] || return 1
+  ! printf '%s' "$ROWS" | LC_ALL=C awk -F '\t' '$2 != "installed" { f = 1 } END { exit !f }'
+}
+
+do_status() {
+  local e state n p shown miss=0 dup=0 stale=0
+  collect
+  if [ -n "$QUIET" ]; then
+    if all_installed; then return 0; fi
+    return 1
+  fi
+  if [ -n "$TSV" ]; then
+    printf 'file\t%s\t%s\t%s\n' "$SETTINGS" "$([ -e "$REAL" ] && echo 1 || echo 0)" "$METHOD"
+    [ -z "$INVALID" ] || printf 'invalid\t%s\n' "$(printf '%s' "$INVALID" | LC_ALL=C tr '\t\n' '  ')"
+    printf '%s' "$ROWS" | LC_ALL=C awk '{ print "event\t" $0 }'
+    for e in $FLAGS; do printf 'flag\t%s\n' "$e"; done
+    if all_installed; then return 0; fi
+    return 1
+  fi
+  if [ -n "$INVALID" ]; then
+    echo "Claude Code hook: can't read $SHOWN"
+    printf '  %s\n' "$INVALID"
+    return 1
+  fi
+  if [ "$METHOD" = grep ]; then
+    echo "Claude Code hook in $SHOWN (checked without jq: approximate):"
+  elif [ -e "$REAL" ]; then
+    echo "Claude Code hook in $SHOWN:"
+  else
+    echo "Claude Code hook: $SHOWN does not exist"
+  fi
+  while IFS=$'\t' read -r e state n p; do
+    [ -n "$e" ] || continue
+    shown=$(tildify "$p")
+    case $state in
+      installed)
+        if [ "$e" = "*" ]; then
+          printf '  %s\n' "installed: $n guarded bellhop-hook entries run $shown"
+        elif [ "$n" -gt 1 ]; then
+          printf '  %-17s %s\n' "$e" "installed, $n entries (duplicate: it runs $n times)"
+          dup=$((dup + 1))
+        else
+          printf '  %-17s %s\n' "$e" "installed"
+        fi
+        ;;
+      stale)
+        printf '  %-17s %s\n' "$e" "stale: ${shown:-its path} is not executable"
+        stale=$((stale + 1))
+        ;;
+      *)
+        if [ "$e" = "*" ]; then
+          printf '  %s\n' "not installed ($n of 5 entries found with an executable path)"
+        else
+          printf '  %-17s %s\n' "$e" "missing"
+        fi
+        miss=$((miss + 1))
+        ;;
+    esac
+  done <<<"$ROWS"
+  for e in $FLAGS; do
+    echo "$e is true in $SHOWN: installed hooks are there, but Claude Code won't run them"
+  done
+  if [ $((miss + stale)) -gt 0 ]; then
+    echo "fix: bellhop hook install"
+  elif [ "$dup" -gt 0 ]; then
+    echo "fix: bellhop hook uninstall && bellhop hook install"
+  fi
+  if all_installed; then return 0; fi
+  return 1
+}
+
+case $SUB in
+  install) do_install ;;
+  uninstall) do_uninstall ;;
+  status) do_status ;;
+esac
