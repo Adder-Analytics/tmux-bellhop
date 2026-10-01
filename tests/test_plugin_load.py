@@ -42,8 +42,9 @@ isset = lambda s, name: s.t("show-options", "-gq", name) != ""
 # ── a stock server: all three defaults bound, stock bindings recorded ──────────
 s = Server("plugin", conf=None).start("-s", "a", "-n", "one")
 STOCK = {k: keyline(s, k) for k in ("i", "/", "m")}
-STOCK_NOTES = [l for l in s.t("list-keys", "-N", "-T", "prefix").splitlines()
-               if l.split()[1:2] in (["i"], ["/"], ["m"])]
+# -P '' puts the key first on every tmux (3.4 prints no prefix, 3.7 prints C-b).
+STOCK_NOTES = [l for l in s.t("list-keys", "-N", "-P", "", "-T", "prefix").splitlines()
+               if l.split()[0:1] in (["i"], ["/"], ["m"])]
 check("stock tmux: i, / and m are bound to tmux's defaults",
       (STOCK["i"].split()[-1], "select-pane -m" in STOCK["m"], "command-prompt -k -p key" in STOCK["/"]),
       ("display-message", True, True))
@@ -86,7 +87,8 @@ check("re-source: the keys are ours and the records are still the stock ones",
 out = load(s, "unload")
 check("unload: i, / and m are stock again", [keyline(s, k) == STOCK[k] for k in ("i", "/", "m")], [True] * 3)
 check("unload: their prefix ? notes are back",
-      ([l for l in s.t("list-keys", "-N", "-T", "prefix").splitlines() if l.split()[1:2] in (["i"], ["/"], ["m"])],
+      ([l for l in s.t("list-keys", "-N", "-P", "", "-T", "prefix").splitlines()
+        if l.split()[0:1] in (["i"], ["/"], ["m"])],
        len(STOCK_NOTES)), (STOCK_NOTES, 3))
 hk = hooks(s)
 check("unload: our hooks are gone, the user's hook and key remain",
@@ -151,6 +153,9 @@ w2 = s.t("new-window", "-d", "-P", "-F", "#{window_id}", "-t", "a:", "sh")
 w3 = s.t("new-window", "-d", "-P", "-F", "#{window_id}", "-t", "a:", "sh")
 s.t("select-pane", "-t", w2, "-T", "✳ Fix the flaky test")
 s.t("select-pane", "-t", w3, "-T", "user@host:~/src/a")
+# tmux 3.4 re-evaluates a tab's name on pane output, not on select-pane -T
+# (Claude's title arrives with output); one Enter is enough output.
+s.t("send-keys", "-t", w2, "Enter")
 name = lambda w: s.fmt(w, "#{window_name}")
 wait_for(lambda: name(w2) == "Fix the flaky test", "the Claude tab named after its title")
 check("@bellhop-tab-titles on: a Claude tab is named after its title, glyph stripped; a shell keeps tmux's name",

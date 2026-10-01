@@ -338,7 +338,10 @@ class Client:
         raw = re.sub(r"\x1b\[[0-9;:?]*m", "", raw)
         raw = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "\n", raw)
         raw = re.sub(r"\x1b[^\x1b]{0,2}", "", raw)
-        return [line.strip() for line in raw.split("\n") if line.strip()]
+        # tmux 3.4 draws the popup's border and a row's text in one run, so a
+        # line can start or end with the border's │; 3.7 draws them apart.
+        lines = (line.strip().strip("│").strip() for line in raw.split("\n"))
+        return [line for line in lines if line]
 
     def wait_prompt(self, since=0, prompt="›"):
         """Wait until fzf has drawn its prompt (so keys reach fzf, not the pane).
